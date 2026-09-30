@@ -54,6 +54,13 @@ static struct {
     uint32_t     seq;                 /* 已发布帧计数 */
     uint32_t     shown_seq;           /* 消费端已取走的帧计数 */
 
+    /* 拍照：请求标志由 UI 线程置、解码线程清；截下的帧放在 capture_buf 里。
+     * capture_ready 为真表示有帧等着被 UI 线程取走 */
+    uint8_t     *capture_buf;
+    size_t       capture_size;
+    volatile int capture_req;
+    int          capture_ready;
+
     pthread_mutex_t lock;
     pthread_t    thread;
     int          running;
@@ -152,6 +159,18 @@ static void *decode_thread(void *arg)
 
         /* 超时返回 -1，正好用来周期性回查 running，不必用条件变量 */
         if (fq_pop(g.fq, raw, &sz, POP_TIMEOUT_MS) != 0) continue;
+
+        /* 拍照请求：把这一帧的原始 MJPEG 字节留下来给 UI 线程写文件。
+         * 必须在这里做而不是让 UI 线程去读队列——队列是解码线程独占消费的。
+         * memcpy 20KB 只要几十微秒，不影响预览节奏 */
+        if (g.capture_req) {
+            memcpy(g.capture_buf, raw, sz);
+            pthread_mutex_lock(&g.lock);
+            g.capture_size  = sz;
+            g.capture_ready = 1;
+            pthread_mutex_unlock(&g.lock);
+            g.capture_req = 0;
+        }
 
         const double t0 = now_sec();
 
@@ -282,6 +301,15 @@ int cam_preview_start(const char *device, int out_w, int out_h,
         goto fail_dec;
     }
 
+    /* 拍照缓冲：要装得下驱动可能给的最大帧（MJPEG 是变长格式，
+     * 每帧实际长度都不同，只有 QUERYBUF 报出的上界是可靠的） */
+    const size_t maxf = cap_max_frame_size(g.cap);
+    g.capture_buf = malloc(maxf);
+    if (!g.capture_buf) {
+        fprintf(stderr, "[预览] 拍照缓冲分配失败（%zu 字节）\n", maxf);
+        goto fail_dec;
+    }
+
     for (int i = 0; i < CAM_BUF_COUNT; i++) {
         size_t n = (size_t)g.out_w * g.out_h * 2;
         g.dst[i] = malloc(n);
@@ -292,9 +320,8 @@ int cam_preview_start(const char *device, int out_w, int out_h,
         memset(g.dst[i], 0, n);
     }
 
-    /* 队列每槽要能装下驱动报的最大帧，否则 fq_push 会静默丢帧——
-     * cap_start 自己也会校验这一点 */
-    const size_t maxf = cap_max_frame_size(g.cap);
+    /* 队列每槽要能装下驱动报的最大帧（maxf，上面已取），
+     * 否则 fq_push 会静默丢帧——cap_start 自己也会校验这一点 */
     g.fq = fq_create(CAM_QUEUE_FRAMES, maxf, FQ_DROP_OLDEST);
     if (!g.fq) {
         fprintf(stderr, "[预览] 队列创建失败（%d 槽 × %zu 字节）\n",
@@ -343,9 +370,11 @@ fail_bufs:
     free(g.decoded);
     g.decoded = NULL;
 fail_dec:
-    /* 从这里往前，xmap 一定已经分配过了，统一在这一层回收 */
+    /* xmap / captured_buf 在这里统一回收；未分配时 free(NULL) 也安全 */
     free(g.xmap);
     g.xmap = NULL;
+    free(g.capture_buf);
+    g.capture_buf = NULL;
     decoder_destroy(g.dec);
     g.dec = NULL;
 fail_cap:
@@ -372,8 +401,34 @@ void cam_preview_stop(void)
     for (int i = 0; i < CAM_BUF_COUNT; i++) free(g.dst[i]);
     free(g.decoded);
     free(g.xmap);
+    free(g.capture_buf);
 
     g_inited = 0;
+}
+
+void cam_preview_request_capture(void)
+{
+    if (!g_inited) return;
+    g.capture_req = 1;
+}
+
+size_t cam_preview_take_captured(const uint8_t **data)
+{
+    size_t n = 0;
+
+    if (!g_inited || !data) return 0;
+
+    pthread_mutex_lock(&g.lock);
+    if (g.capture_ready) {
+        n = g.capture_size;
+        *data = g.capture_buf;
+        /* 交给调用方。解码线程在下一次新请求生效前不会再写这块缓冲 */
+        g.capture_ready = 0;
+        g.capture_size  = 0;
+    }
+    pthread_mutex_unlock(&g.lock);
+
+    return n;
 }
 
 const uint8_t *cam_preview_frame(uint32_t *seq)

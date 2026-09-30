@@ -1,8 +1,13 @@
 /*
- * 阶段 2：实时预览
+ * 阶段 3：实时预览 + 拍照
  *
- * 已通：LVGL 画到 /dev/fb0、触摸从 /dev/input/eventX 进来、摄像头实时画面。
- * 三个按钮暂时只打印，阶段 3~5 分别接上拍照 / 相册 / 删除。
+ * 已通：LVGL 画到 /dev/fb0、触摸从 /dev/input/eventX 进来、摄像头实时画面、
+ *       按「拍照」把当前帧存成 JPEG。
+ * 「相册」暂时只打印，阶段 4/5 分别接上相册和删除。
+ *
+ * 拍照走的是零编码路径：摄像头输出 MJPEG，而每个 MJPEG 帧本身就是一张完整
+ * JPEG 文件，所以直接写盘即可——没有编码开销，也没有画质损失，
+ * 存下来还是摄像头原始分辨率(640x360)，不受屏幕尺寸影响。
  *
  * 布局全部按显示驱动报告的实际分辨率算，不写死尺寸——
  * 换一块屏不用改代码，也不会出现按钮跑到屏幕外面的情况。
@@ -11,21 +16,40 @@
  *   libcamera 采集线程 → 环形队列 → 本进程解码线程 → 三缓冲 → LVGL 主线程
  * 解码线程绝不碰 lv_*，两边只交换一个裸缓冲指针。
  *
- * 用法：./lvgl_camera [fbdev] [input_event] [video_dev]
- *       默认 /dev/fb0、/dev/input/event1、/dev/video0
- *       触摸没反应就换个 event 号，见 /proc/bus/input/devices
+ * 用法：./lvgl_camera [fbdev] [input_event] [video_dev] [photo_dir]
+ *
+ * 四个参数都有默认值，直接 ./lvgl_camera 即可：
+ *   /dev/fb0  /dev/input/event1  /dev/video2  /run/media/mmcblk0p1/photos
+ *
+ * 需要覆盖时才传参，比如触摸没反应换个 event 号（见 /proc/bus/input/devices），
+ * 或者把照片存到别的目录。
  */
 #include "lvgl.h"
 #include "camera_preview.h"
+#include "photo_store.h"
 
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>   /* memset——之前一直靠其他头文件传递包含，很脆弱 */
 #include <unistd.h>
 
 #define DEF_FBDEV  "/dev/fb0"
 #define DEF_INPUT  "/dev/input/event1"
-#define DEF_V4L2   "/dev/video0"
+#define DEF_V4L2   "/dev/video2"   /* 本板的 UVC 摄像头在 video2，不是 video0 */
+
+/*
+ * 默认照片目录。
+ *
+ * 选 /run/media/mmcblk0p1 而不是 /mnt/sdcard，是因为后者有个静默陷阱：
+ * 自己 mkdir + mount 的路径在「已挂载」和「未挂载」两种状态下都"存在"，
+ * 程序分辨不出来。卡没挂时照片会被悄悄写进 eMMC，不报任何错。
+ * 已经踩过：重启后手动挂载失效，照片就跑到了根文件系统上。
+ *
+ * 而 /run/media/mmcblk0p1 由系统在插卡时自动挂载，卡不在时这个路径
+ * 压根不存在——启动就会报「无法创建目录」。失败得早，比失败得安静好。
+ */
+#define DEF_PHOTO_DIR "/run/media/mmcblk0p1/photos"
 
 /*
  * 期望的摄像头分辨率。
@@ -85,6 +109,26 @@ static lv_image_dsc_t g_img_dsc;
 static lv_obj_t      *g_preview_img;
 static int            g_src_set;
 
+/* -------------------------------------------------------------------------
+ * 浮层提示：显示一小会儿自动隐藏。
+ * 拍照是个瞬时动作，需要一点反馈告诉用户「按到了、存好了」。
+ * ------------------------------------------------------------------------- */
+static lv_obj_t *g_toast;
+
+static void toast_hide_cb(lv_timer_t *t)
+{
+    lv_obj_set_hidden(g_toast, true);
+    lv_timer_delete(t);
+}
+
+static void toast_show(const char *text, uint32_t ms)
+{
+    lv_label_set_text(g_toast, text);
+    lv_obj_set_hidden(g_toast, false);
+    /* 重复次数设 1 = 一次性，跑完自己删掉，不用手工管理定时器 */
+    lv_timer_set_repeat_count(lv_timer_create(toast_hide_cb, ms, NULL), 1);
+}
+
 /*
  * 定时取帧。这是 LVGL 主线程，也是唯一允许碰 lv_* 的地方。
  *
@@ -98,6 +142,30 @@ static int            g_src_set;
 static void preview_timer_cb(lv_timer_t *t)
 {
     (void)t;
+
+    /*
+     * 先处理拍照落盘。
+     *
+     * 写 20KB 到 flash 要 10~50ms，会让这一轮渲染晚一点——但用户刚按下快门，
+     * 这点停顿符合预期，也省掉了专门开一个写盘线程。放在取帧之前，
+     * 这样即使此刻恰好在队列超时期间、没有新预览帧，也能及时把照片存下来。
+     */
+    const uint8_t *jpeg = NULL;
+    size_t n = cam_preview_take_captured(&jpeg);
+    if (n > 0) {
+        char name[64];
+        if (photo_store_save(jpeg, n, name, sizeof(name)) == 0) {
+            char msg[96];
+            printf("[拍照] 已保存 %s/%s（%zu 字节，共 %d 张）\n",
+                   photo_store_dir(), name, n, photo_store_count());
+            fflush(stdout);
+            snprintf(msg, sizeof(msg), "已保存 %s", name);
+            toast_show(msg, 1500);
+        }
+        else {
+            toast_show("保存失败", 2000);
+        }
+    }
 
     uint32_t seq = 0;
     const uint8_t *frame = cam_preview_frame(&seq);
@@ -116,14 +184,15 @@ static void preview_timer_cb(lv_timer_t *t)
 }
 
 /*
- * 按钮回调，现在只打印。阶段 3/4 分别接上拍照和相册。
- * 「删除」按钮阶段 5 再加回来——侧栏还有空间，届时三个圆形键重排即可。
+ * 按钮回调。阶段 4/5 分别接上相册和删除。
+ * 「删除」按钮阶段 5 再加回来——右侧还有空间，届时三个圆钮重排即可。
  */
 static void on_capture(lv_event_t *e)
 {
     (void)e;
-    printf("[按钮] 拍照（阶段 3 实现）\n");
-    fflush(stdout);
+    /* 只置个标志就返回，不阻塞 UI；真正的截帧在解码线程里发生 */
+    cam_preview_request_capture();
+    toast_show("保存中…", 1000);
 }
 
 static void on_gallery(lv_event_t *e)
@@ -212,7 +281,7 @@ int main(int argc, char **argv)
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x101418), LV_PART_MAIN);
     lv_obj_set_style_pad_all(scr, 0, LV_PART_MAIN);
-    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollable(scr, false);
 
     /*
      * 给 screen 设字体，靠 LVGL 的样式继承覆盖底下所有控件，
@@ -231,7 +300,7 @@ int main(int argc, char **argv)
     lv_obj_set_style_border_width(preview, 0, LV_PART_MAIN);
     lv_obj_set_style_radius(preview, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(preview, 0, LV_PART_MAIN);
-    lv_obj_clear_flag(preview, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollable(preview, false);
 
     /*
      * 图像描述符：尺寸与预览区一致，格式 RGB565。
@@ -266,6 +335,33 @@ int main(int argc, char **argv)
 
     lv_obj_t *b2 = make_button(scr, "相册", on_gallery, BTN_D);
     lv_obj_align(b2, LV_ALIGN_RIGHT_MID, -BTN_MARGIN, half);
+
+    /* 拍照反馈浮层。初始隐藏，toast_show() 时才出现，过一会儿自动消失 */
+    g_toast = lv_label_create(scr);
+    lv_label_set_text(g_toast, "");
+    lv_obj_set_style_bg_color(g_toast, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(g_toast, LV_OPA_70, LV_PART_MAIN);
+    lv_obj_set_style_text_color(g_toast, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_set_style_pad_all(g_toast, 6, LV_PART_MAIN);
+    lv_obj_set_style_radius(g_toast, 6, LV_PART_MAIN);
+    lv_obj_align(g_toast, LV_ALIGN_TOP_MID, 0, 14);
+    lv_obj_set_hidden(g_toast, true);
+
+    /* ---------------- 照片存储 ---------------- */
+
+    /*
+     * 目录不可用不该让整个程序挂掉——预览和触摸还能用，
+     * 只是按下快门会提示保存失败，日志里也会说明原因。
+     */
+    const char *photo_dir = (argc > 4) ? argv[4] : DEF_PHOTO_DIR;
+
+    if (photo_store_init(photo_dir) == 0) {
+        printf("[存储] 照片目录: %s（现有 %d 张）\n",
+               photo_store_dir(), photo_store_count());
+    }
+    else {
+        fprintf(stderr, "错误: 照片目录不可用，拍照会失败\n");
+    }
 
     /* ---------------- 摄像头 ---------------- */
 

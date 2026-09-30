@@ -45,6 +45,7 @@ add_subdirectory(libcamera)
 add_executable(lvgl_camera
     app/main.c
     app/camera_preview.c
+    app/photo_store.c
     app/font_zh_16.c
 )
 
