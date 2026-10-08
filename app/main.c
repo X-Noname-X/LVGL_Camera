@@ -1,13 +1,16 @@
 /*
- * 阶段 3：实时预览 + 拍照
+ * 阶段 4：实时预览 + 拍照 + 相册
  *
  * 已通：LVGL 画到 /dev/fb0、触摸从 /dev/input/eventX 进来、摄像头实时画面、
- *       按「拍照」把当前帧存成 JPEG。
- * 「相册」暂时只打印，阶段 4/5 分别接上相册和删除。
+ *       按「拍照」存 JPEG、按「相册」单张大图浏览并翻页。
+ * 删除留到阶段 5。
  *
  * 拍照走的是零编码路径：摄像头输出 MJPEG，而每个 MJPEG 帧本身就是一张完整
  * JPEG 文件，所以直接写盘即可——没有编码开销，也没有画质损失，
  * 存下来还是摄像头原始分辨率(640x360)，不受屏幕尺寸影响。
+ *
+ * 两个页面用「相册整页盖住相机页」来切换，不是 LVGL 的多 screen——
+ * 这样相机页的控件一个都不用重新挂父对象。代价是预览定时器要跳过刷新。
  *
  * 布局全部按显示驱动报告的实际分辨率算，不写死尺寸——
  * 换一块屏不用改代码，也不会出现按钮跑到屏幕外面的情况。
@@ -27,7 +30,9 @@
 #include "lvgl.h"
 #include "camera_preview.h"
 #include "photo_store.h"
+#include "photo_view.h"
 
+#include <limits.h>   /* PATH_MAX */
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -75,16 +80,30 @@
 #define PREVIEW_PERIOD_MS 33
 
 /*
- * 中文字体子集，由 tools/gen_font.sh 生成（16px / 4bpp）。
- *
- * 为什么不用 LVGL 内置的那两款 CJK 字体：它们并不是完整的思源黑体，
- * 实测只覆盖 1450 个码点、其中汉字仅 297 个，本项目 UI 用字一个都不在
- * 里面，直接就是满屏方框。所以自己抽一份。
- *
- * 加新文案后如果出现方框：把新字补进 tools/gen_font.sh 的 SYMBOLS，
- * 重跑该脚本，再重新构建。脚本自带校验，缺字会当场报错。
+ * 相册一次最多列多少张。用固定数组而不是动态分配：一张照片的文件名才
+ * 12+ 字节，128 张也就 4KB，省去一套内存管理。
+ * 超出部分会被静默丢弃——要改就改这里，photo_store_list 的注释里有说明。
  */
-LV_FONT_DECLARE(font_zh_16);
+#define PHOTO_MAX_LIST 128
+
+/*
+ * 界面字体，就是放大一号的 Montserrat_24。
+ *
+ * 两个用途：
+ *   1. 按钮图标——LV_SYMBOL_* 是一组 Unicode 私用区码点，字形直接编在
+ *      Montserrat 里。所以开个够大的尺寸就能白拿几十个图标，
+ *      不用自己做图标字体。48px 的圆钮配 24px 图标正好。
+ *   2. 屏幕上那几句英文提示（"No photos" 之类）——字体本身是拉丁字体，
+ *      渲染 ASCII 是本职工作。用 24px 而不是默认的 14px，是因为
+ *      屏幕只有 480x272，小字看着费劲。
+ *
+ * 图标用法就是把 LV_SYMBOL_xxx 当普通字符串传给 lv_label_set_text()，
+ * 渲染时自然落到这个字体的私用区字形上。
+ *
+ * 注意屏幕上的文字只能用 ASCII——中文字体已经删了，写汉字会是方框。
+ * 终端的 printf 日志不受此限，照旧用中文。
+ */
+#define ICON_FONT (&lv_font_montserrat_24)
 
 /*
  * Ctrl+C 退出标志。有采集和解码线程在跑，不能直接被杀——那样摄像头设备
@@ -108,6 +127,26 @@ static void on_signal(int sig)
 static lv_image_dsc_t g_img_dsc;
 static lv_obj_t      *g_preview_img;
 static int            g_src_set;
+static lv_timer_t    *g_preview_timer;   /* 退出前要停掉它再清屏 */
+
+/* -------------------------------------------------------------------------
+ * 相册页
+ *
+ * 页面切换用「全屏不透明容器盖住」而不是 LVGL 的多 screen：相册页盖满整屏，
+ * 显示时把相机页整个遮住即可，不用把相机页的控件重新挂到别的父对象上。
+ * 代价是要在预览定时器里跳过刷新（见 preview_timer_cb），否则会在看不见的
+ * 地方白刷一帧。
+ * ------------------------------------------------------------------------- */
+static lv_obj_t      *g_page_album;      /* 全屏容器，默认隐藏 */
+static lv_obj_t      *g_album_img;       /* 照片 */
+static lv_obj_t      *g_album_label;     /* 「第 N / 共 M 张」 */
+static lv_image_dsc_t g_album_dsc;       /* 指向 photo_view 的内部缓冲 */
+static lv_obj_t      *g_album_hint;      /* 空相册/打不开时的提示文字 */
+
+static char g_names[PHOTO_MAX_LIST][PHOTO_NAME_MAX];
+static int  g_count;                     /* 当前列表里有多少张 */
+static int  g_index;                     /* 正在看第几张（0 起） */
+static int  g_photo_area_w, g_photo_area_h;   /* 照片可用区尺寸 */
 
 /* -------------------------------------------------------------------------
  * 浮层提示：显示一小会儿自动隐藏。
@@ -156,16 +195,25 @@ static void preview_timer_cb(lv_timer_t *t)
         char name[64];
         if (photo_store_save(jpeg, n, name, sizeof(name)) == 0) {
             char msg[96];
+            /* 终端日志照旧用中文；屏幕上是英文——中文字体已经删掉，
+             * 界面上只剩 Montserrat 一套拉丁字形，写汉字会是方框 */
             printf("[拍照] 已保存 %s/%s（%zu 字节，共 %d 张）\n",
                    photo_store_dir(), name, n, photo_store_count());
             fflush(stdout);
-            snprintf(msg, sizeof(msg), "已保存 %s", name);
+            snprintf(msg, sizeof(msg), "Saved %s", name);
             toast_show(msg, 1500);
         }
         else {
-            toast_show("保存失败", 2000);
+            toast_show("Save failed", 2000);
         }
     }
+
+    /*
+     * 相册页显示时它整个盖住了预览，刷新看不见的画面纯属白烧 CPU——
+     * 解码线程仍在后台跑（停/启 V4L2 流有风险，不值得为省这点电去动），
+     * 但至少别再往看不见的 lv_image 上刷帧。
+     */
+    if (!lv_obj_is_hidden(g_page_album)) return;
 
     uint32_t seq = 0;
     const uint8_t *frame = cam_preview_frame(&seq);
@@ -183,30 +231,34 @@ static void preview_timer_cb(lv_timer_t *t)
     lv_obj_invalidate(g_preview_img);
 }
 
+/* 相册页的实现排在后面，这里先声明——on_gallery 要用 */
+static void album_enter(void);
+
 /*
- * 按钮回调。阶段 4/5 分别接上相册和删除。
- * 「删除」按钮阶段 5 再加回来——右侧还有空间，届时三个圆钮重排即可。
+ * 按钮回调。删除留到阶段 5——相册页右侧还有位置，届时加第四个圆钮即可。
  */
 static void on_capture(lv_event_t *e)
 {
     (void)e;
-    /* 只置个标志就返回，不阻塞 UI；真正的截帧在解码线程里发生 */
+    /* 只置个标志就返回，不阻塞 UI；真正的截帧在解码线程里发生。
+     * 这里不弹「保存中」提示——截帧发生在下一个解码帧（约 35ms 后），
+     * 结果提示马上就来了，中间那句会一闪而过反而碍眼 */
     cam_preview_request_capture();
-    toast_show("保存中…", 1000);
 }
 
 static void on_gallery(lv_event_t *e)
 {
     (void)e;
-    printf("[按钮] 相册（阶段 4 实现）\n");
-    fflush(stdout);
+    album_enter();
 }
 
 /*
  * 圆形按钮：LVGL 里没有专门的圆形控件，做法是正方形 + 圆角半径取一半
  * （LV_RADIUS_CIRCLE 就是「按短边取半」的语义），正方形配它才是正圆。
+ *
+ * icon 传 LV_SYMBOL_* 常量即可。
  */
-static lv_obj_t *make_button(lv_obj_t *parent, const char *text,
+static lv_obj_t *make_button(lv_obj_t *parent, const char *icon,
                              lv_event_cb_t cb, int32_t diameter)
 {
     lv_obj_t *btn = lv_button_create(parent);
@@ -218,19 +270,307 @@ static lv_obj_t *make_button(lv_obj_t *parent, const char *text,
     lv_obj_set_style_pad_all(btn, 0, LV_PART_MAIN);
 
     /*
-     * 浮在实时画面上，必须半透明，否则一个实心圆把画面挡掉一块，
-     * 而且画面明暗变化时纯色按钮会显得很突兀。
+     * 全部按钮都浮在实时画面或照片上，必须半透明，否则一个实心圆把内容
+     * 挡掉一块，而且画面明暗变化时纯色按钮会很突兀。
      * 描边保证在浅色画面上也看得见轮廓。
+     *
+     * 底色用纯黑而不是主题色：照片和预览的明暗跨度大，只有黑色能保证
+     * 白色图标和白色描边在两种背景下都有足够对比度。
      */
-    lv_obj_set_style_bg_opa(btn, LV_OPA_60, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_50, LV_PART_MAIN);
     lv_obj_set_style_border_width(btn, 2, LV_PART_MAIN);
     lv_obj_set_style_border_color(btn, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-    lv_obj_set_style_border_opa(btn, LV_OPA_50, LV_PART_MAIN);
+    lv_obj_set_style_border_opa(btn, LV_OPA_40, LV_PART_MAIN);
+
+    /*
+     * 关掉阴影。
+     *
+     * LVGL 默认主题给按钮加的是「灰色、宽 3、50% 透明、**向下偏移 3px**」的
+     * 投影（src/themes/default/lv_theme_default.c 的 styles.btn）。
+     * 按钮浮在预览画面和照片上时，这圈影子就表现为下半边发虚、像重影。
+     *
+     * 主题里 radius/bg_opa/bg_color/pad 我们都已经覆盖，唯独漏了阴影这一项。
+     */
+    lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN);
 
     lv_obj_t *label = lv_label_create(btn);
-    lv_label_set_text(label, text);
+    lv_label_set_text(label, icon);
+    /* 图标字形在 Montserrat 里，必须显式指定这个字体，
+     * 否则默认的 14px 会让 48px 的圆里只出现一个小点 */
+    lv_obj_set_style_text_font(label, ICON_FONT, LV_PART_MAIN);
+    lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
     lv_obj_center(label);
     return btn;
+}
+
+/* -------------------------------------------------------------------------
+ * 相册页
+ * ------------------------------------------------------------------------- */
+
+/* 显示第 g_index 张。索引越界会自动夹回范围 */
+static void album_show_index(void)
+{
+    char path[PATH_MAX];
+    int  w = 0, h = 0;
+    const uint8_t *buf;
+
+    /* 计数一直显示，空相册就是 0/0 */
+    lv_label_set_text_fmt(g_album_label, "%d/%d",
+                          g_count > 0 ? g_index + 1 : 0, g_count);
+
+    if (g_index < 0)        g_index = 0;
+    if (g_index >= g_count) g_index = g_count - 1;
+
+    if (g_count <= 0) {
+        /* 空相册。居中一句英文——屏幕上是拉丁字体，写不了汉字 */
+        lv_obj_set_hidden(g_album_img, true);
+        lv_label_set_text(g_album_hint, "No photos");
+        lv_obj_set_hidden(g_album_hint, false);
+        return;
+    }
+
+    photo_store_path(g_names[g_index], path, sizeof(path));
+
+    buf = photo_view_open(path, g_photo_area_w, g_photo_area_h, &w, &h);
+    if (buf == NULL) {
+        /* 单张打不开不该让整个相册不可用，给句提示继续翻别的 */
+        lv_obj_set_hidden(g_album_img, true);
+        lv_label_set_text(g_album_hint, "Cannot open");
+        lv_obj_set_hidden(g_album_hint, false);
+        return;
+    }
+
+    /* 每张的尺寸都可能不同，所以 header 要重填、set_src 要重调——
+     * LVGL 只在 lv_image_set_src 时读一次 w/h/cf，之后改 dsc 不生效 */
+    g_album_dsc.header.magic  = LV_IMAGE_HEADER_MAGIC;
+    g_album_dsc.header.cf     = LV_COLOR_FORMAT_RGB565;
+    g_album_dsc.header.w      = (uint32_t)w;
+    g_album_dsc.header.h      = (uint32_t)h;
+    g_album_dsc.header.stride = (uint32_t)w * 2;
+    g_album_dsc.data_size     = (uint32_t)w * (uint32_t)h * 2;
+    g_album_dsc.data          = buf;
+
+    lv_image_set_src(g_album_img, &g_album_dsc);
+    lv_obj_set_size(g_album_img, w, h);
+    lv_obj_center(g_album_img);
+    lv_obj_set_hidden(g_album_img, false);
+
+    lv_obj_set_hidden(g_album_hint, true);
+}
+
+static void album_enter(void)
+{
+    /* 每次进来都重扫目录——上次进来之后可能又拍了新的 */
+    g_count = photo_store_list(g_names, PHOTO_MAX_LIST);
+
+    /* 从最新那张看起，符合「拍完马上看」的习惯。
+     * 空相册时 g_index 会是 -1，album_show_index 里会先处理掉 */
+    g_index = g_count - 1;
+
+    album_show_index();
+    lv_obj_set_hidden(g_page_album, false);
+
+    if (g_count > 0)
+        printf("[相册] 共 %d 张，从第 %d 张看起\n", g_count, g_index + 1);
+    else
+        printf("[相册] 目录里还没有照片\n");
+    fflush(stdout);
+}
+
+/* 三个按钮的回调。翻页到头会绕回去，这样不用先判断方向能不能翻 */
+static void on_album_prev(lv_event_t *e)
+{
+    (void)e;
+    if (g_count <= 0) return;
+    g_index--;
+    if (g_index < 0) g_index = g_count - 1;
+    album_show_index();
+}
+
+static void on_album_next(lv_event_t *e)
+{
+    (void)e;
+    if (g_count <= 0) return;
+    g_index++;
+    if (g_index >= g_count) g_index = 0;
+    album_show_index();
+}
+
+static void on_album_back(lv_event_t *e)
+{
+    (void)e;
+    lv_obj_set_hidden(g_page_album, true);
+}
+
+/* 删除确认浮层的实现排在 album_build 之后，这里先声明 */
+static void album_confirm_delete(void);
+
+static void on_album_delete(lv_event_t *e)
+{
+    (void)e;
+    album_confirm_delete();
+}
+
+/* 建相册页。parent 通常是 screen；整页盖满，默认隐藏 */
+static void album_build(lv_obj_t *parent, int32_t W, int32_t H)
+{
+    /*
+     * 照片铺满整屏，按钮浮在它上面——不再切出一条右侧按钮栏。
+     * 这样照片能用满 480x272，代价是按钮会压住画面边角，
+     * 所以按钮都做成半透明、描边，并且刻意贴四个角，少挡中间的内容。
+     */
+    g_photo_area_w = W;
+    g_photo_area_h = H;
+
+    g_page_album = lv_obj_create(parent);
+    lv_obj_set_size(g_page_album, W, H);
+    lv_obj_set_pos(g_page_album, 0, 0);
+    lv_obj_set_style_bg_color(g_page_album, lv_color_hex(0x101418), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(g_page_album, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(g_page_album, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(g_page_album, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(g_page_album, 0, LV_PART_MAIN);
+    lv_obj_set_scrollable(g_page_album, false);
+    lv_obj_set_hidden(g_page_album, true);
+
+    /* 照片。尺寸和内容每张都不一样，在 album_show_index 里填 */
+    memset(&g_album_dsc, 0, sizeof(g_album_dsc));
+    g_album_img = lv_image_create(g_page_album);
+    lv_obj_set_hidden(g_album_img, true);
+
+    /* 空相册 / 单张打不开时的提示：屏幕正中一个大图标 */
+    g_album_hint = lv_label_create(g_page_album);
+    lv_label_set_text(g_album_hint, "");
+    lv_obj_set_style_text_font(g_album_hint, ICON_FONT, LV_PART_MAIN);
+    lv_obj_set_style_text_color(g_album_hint, lv_color_hex(0x506070), LV_PART_MAIN);
+    lv_obj_center(g_album_hint);
+    lv_obj_set_hidden(g_album_hint, true);
+
+    /*
+     * 计数「当前/总数」，放右上角——和左上角的返回键分踞两侧互不遮挡。
+     * 用 ASCII 数字而不是「第 N / 共 M 张」，省掉一整套中文字体。
+     */
+    g_album_label = lv_label_create(g_page_album);
+    lv_label_set_text(g_album_label, "0/0");
+    lv_obj_set_style_bg_color(g_album_label, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(g_album_label, LV_OPA_50, LV_PART_MAIN);
+    lv_obj_set_style_text_color(g_album_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_set_style_pad_all(g_album_label, 4, LV_PART_MAIN);
+    lv_obj_set_style_radius(g_album_label, 4, LV_PART_MAIN);
+    lv_obj_align(g_album_label, LV_ALIGN_TOP_RIGHT, -BTN_MARGIN, BTN_MARGIN);
+
+    /*
+     * 四个按钮分踞四边：
+     *   左上 返回   右上 计数   左中 上一张   右中 下一张   右下 删除
+     * 图标用 LV_SYMBOL_*，字形取自 Montserrat 私用区
+     */
+    lv_obj_t *b;
+
+    b = make_button(g_page_album, LV_SYMBOL_CLOSE, on_album_back, BTN_D);
+    lv_obj_align(b, LV_ALIGN_TOP_LEFT, BTN_MARGIN, BTN_MARGIN);
+
+    b = make_button(g_page_album, LV_SYMBOL_LEFT, on_album_prev, BTN_D);
+    lv_obj_align(b, LV_ALIGN_LEFT_MID, BTN_MARGIN, 0);
+
+    b = make_button(g_page_album, LV_SYMBOL_RIGHT, on_album_next, BTN_D);
+    lv_obj_align(b, LV_ALIGN_RIGHT_MID, -BTN_MARGIN, 0);
+
+    b = make_button(g_page_album, LV_SYMBOL_TRASH, on_album_delete, BTN_D);
+    lv_obj_align(b, LV_ALIGN_BOTTOM_RIGHT, -BTN_MARGIN, -BTN_MARGIN);
+}
+
+/* -------------------------------------------------------------------------
+ * 删除确认浮层
+ *
+ * 为什么要二次确认：触摸屏误触很常见，而 unlink 不可撤销。
+ * 为什么不用 lv_msgbox：它的按钮是文字按钮，而我们整套 UI 都是图标；
+ * 自建一个浮层既风格统一，也少一个组件依赖。
+ * ------------------------------------------------------------------------- */
+static lv_obj_t *g_confirm;        /* 全屏遮罩，同时也是布局容器 */
+static lv_obj_t *g_confirm_label;
+
+static void confirm_close(void)
+{
+    lv_obj_set_hidden(g_confirm, true);
+}
+
+static void on_confirm_cancel(lv_event_t *e)
+{
+    (void)e;
+    confirm_close();
+}
+
+static void on_confirm_delete(lv_event_t *e)
+{
+    (void)e;
+
+    confirm_close();
+    if (g_count <= 0) return;
+
+    /* 删文件，然后重扫目录。不在内存列表里直接摘——重扫才能反映外部改动
+     * （用户可能同时在串口里删文件），代价也不过一次 readdir */
+    if (photo_store_delete(g_names[g_index]) != 0) {
+        toast_show("Delete failed", 2000);
+        return;
+    }
+
+    g_count = photo_store_list(g_names, PHOTO_MAX_LIST);
+
+    /* 删掉第 i 张之后，原来的第 i+1 张会滑到位置 i，所以索引原地不动
+     * 正好落在下一张上；删的是最后一张时索引越界，夹回末尾即可 */
+    if (g_index >= g_count) g_index = g_count - 1;
+
+    album_show_index();
+    toast_show("Deleted", 1200);
+}
+
+static void album_confirm_delete(void)
+{
+    if (g_count <= 0) return;   /* 空相册没什么可删的，连浮层都不用弹 */
+
+    lv_label_set_text_fmt(g_confirm_label, "Delete %s?", g_names[g_index]);
+    lv_obj_set_hidden(g_confirm, false);
+}
+
+/* 建确认浮层。整屏半透明遮罩，默认隐藏 */
+static void confirm_build(lv_obj_t *parent, int32_t W, int32_t H)
+{
+    g_confirm = lv_obj_create(parent);
+    lv_obj_set_size(g_confirm, W, H);
+    lv_obj_set_pos(g_confirm, 0, 0);
+    lv_obj_set_style_bg_color(g_confirm, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(g_confirm, LV_OPA_70, LV_PART_MAIN);
+    lv_obj_set_style_border_width(g_confirm, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(g_confirm, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(g_confirm, 0, LV_PART_MAIN);
+    lv_obj_set_scrollable(g_confirm, false);
+    lv_obj_set_hidden(g_confirm, true);
+
+    g_confirm_label = lv_label_create(g_confirm);
+    lv_obj_set_style_text_font(g_confirm_label, ICON_FONT, LV_PART_MAIN);
+    lv_obj_set_style_text_color(g_confirm_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_align(g_confirm_label, LV_ALIGN_CENTER, 0, -62);
+
+    /* 取消在左、确认在右。确认键染成红色——这是破坏性操作，
+     * 和旁边那个「关闭」图标必须在视觉上能一眼分开 */
+    lv_obj_t *b = make_button(g_confirm, LV_SYMBOL_CLOSE, on_confirm_cancel, BTN_D);
+    lv_obj_align(b, LV_ALIGN_CENTER, -56, 16);
+
+    b = make_button(g_confirm, LV_SYMBOL_OK, on_confirm_delete, BTN_D);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0xA02020), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(b, LV_OPA_80, LV_PART_MAIN);
+    lv_obj_align(b, LV_ALIGN_CENTER, 56, 16);
+
+    /* 按钮下方补一行文字。图标能省则省，但删除这件事值得写清楚 */
+    lv_obj_t *t = lv_label_create(g_confirm);
+    lv_label_set_text(t, "Cancel");
+    lv_obj_align(t, LV_ALIGN_CENTER, -56, 56);
+
+    t = lv_label_create(g_confirm);
+    lv_label_set_text(t, "Delete");
+    lv_obj_set_style_text_color(t, lv_color_hex(0xFF8080), LV_PART_MAIN);
+    lv_obj_align(t, LV_ALIGN_CENTER, 56, 56);
 }
 
 int main(int argc, char **argv)
@@ -283,11 +623,8 @@ int main(int argc, char **argv)
     lv_obj_set_style_pad_all(scr, 0, LV_PART_MAIN);
     lv_obj_set_scrollable(scr, false);
 
-    /*
-     * 给 screen 设字体，靠 LVGL 的样式继承覆盖底下所有控件，
-     * 不用逐个 label 设。设的必须是字体结构体的地址。
-     */
-    lv_obj_set_style_text_font(scr, &font_zh_16, LV_PART_MAIN);
+    /* 不用给 screen 设字体：界面文案已经全部换成图标或 ASCII，
+     * 图标那一处由 make_button() 单独指定 ICON_FONT，其余走默认的 Montserrat 14 */
 
     /* 预览占满整屏。640x360 与 480x272 比例几乎一致，缩放后只裁 0.74% */
     const int32_t pf_w = W;
@@ -330,15 +667,28 @@ int main(int argc, char **argv)
      */
     const int32_t half = (BTN_D + BTN_GAP) / 2;   /* 圆心相对屏幕中线的偏移 */
 
-    lv_obj_t *b1 = make_button(scr, "拍照", on_capture, BTN_D);
+    /* 摄像机图标 + 图片图标，分别对应拍照和相册 */
+    lv_obj_t *b1 = make_button(scr, LV_SYMBOL_VIDEO, on_capture, BTN_D);
     lv_obj_align(b1, LV_ALIGN_RIGHT_MID, -BTN_MARGIN, -half);
 
-    lv_obj_t *b2 = make_button(scr, "相册", on_gallery, BTN_D);
+    lv_obj_t *b2 = make_button(scr, LV_SYMBOL_IMAGE, on_gallery, BTN_D);
     lv_obj_align(b2, LV_ALIGN_RIGHT_MID, -BTN_MARGIN, half);
 
-    /* 拍照反馈浮层。初始隐藏，toast_show() 时才出现，过一会儿自动消失 */
+    /* 相册页。整页盖满屏幕，默认隐藏——显示它就把相机页遮住了 */
+    album_build(scr, W, H);
+
+    /* 删除确认浮层，盖在相册页之上 */
+    confirm_build(scr, W, H);
+
+    /*
+     * 拍照/删除的反馈浮层。
+     *
+     * 必须**最后**创建：LVGL 按创建顺序叠放，晚建的在上层。放在相册页之前
+     * 的话会被相册页整个盖住，相册里删完照片那句「Deleted」就看不见了。
+     */
     g_toast = lv_label_create(scr);
     lv_label_set_text(g_toast, "");
+    lv_obj_set_style_text_font(g_toast, ICON_FONT, LV_PART_MAIN);
     lv_obj_set_style_bg_color(g_toast, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(g_toast, LV_OPA_70, LV_PART_MAIN);
     lv_obj_set_style_text_color(g_toast, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
@@ -374,7 +724,7 @@ int main(int argc, char **argv)
                 v4l2);
     }
     else {
-        lv_timer_create(preview_timer_cb, PREVIEW_PERIOD_MS, NULL);
+        g_preview_timer = lv_timer_create(preview_timer_cb, PREVIEW_PERIOD_MS, NULL);
     }
 
     printf("[UI] 就绪，等待触摸...\n");
@@ -393,6 +743,31 @@ int main(int argc, char **argv)
     /* 顺序收摊：先停采集与解码线程，再让 LVGL 收尾 */
     printf("\n[退出] 停止摄像头...\n");
     cam_preview_stop();
+
+    /*
+     * 把屏幕擦干净再退出。
+     *
+     * 不擦的话 LCD 会一直停着最后一帧预览画面，看上去像程序还在跑、
+     * 或者像死机了。擦成黑屏最明确：程序已经退了。
+     *
+     * 借 LVGL 自己重绘——清掉所有控件、把底色设成纯黑、强制立刻刷新一次，
+     * 比另外开一遍 /dev/fb0 走 mmap 简单得多。
+     *
+     * 定时器必须先删：preview_timer_cb 会碰 g_preview_img / g_page_album，
+     * 而 lv_obj_clean() 会把它们全释放掉，留着就是个悬空指针。
+     * （清完之后我们不再调 lv_timer_handler，所以其它一次性定时器
+     *   即使还挂着也不会触发。）
+     */
+    if (g_preview_timer != NULL) {
+        lv_timer_delete(g_preview_timer);
+        g_preview_timer = NULL;
+    }
+
+    /* scr 就是上面 UI 段里那个 lv_screen_active()，直接复用 */
+    lv_obj_clean(scr);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+    lv_refr_now(NULL);
     printf("[退出] 已释放 %s\n", v4l2);
     return 0;
 }

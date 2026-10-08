@@ -44,6 +44,35 @@ int decoder_decode(decoder *d, const void *src, size_t src_size,
  * 开了 mjpeg_rgb565 的 MJPEG 解码器则是 width*height*2。 */
 size_t decoder_output_size(const decoder *d);
 
+/* 【相对上游 V4L2-Camera-App 的本地扩展，上游没有这个函数】
+ * 解码内存里的一张独立 JPEG，尺寸由文件头决定，不需要 decoder 对象。
+ * 相册浏览照片用这个——照片是当初拍下的，尺寸事先并不知道，
+ * 而 decoder_create 要求预先声明尺寸。
+ *
+ *   dst/dst_size : 输出缓冲及其容量。按 dst_size 反推容量不够就直接失败，
+ *                  所以调用方可以先按「最坏情况」分配（比如宽*高*2）
+ *   rgb565       : 非 0 输出 RGB565（2 字节/像素），否则 RGB24
+ *   out_w/out_h  : 非 NULL 时写回实际解码尺寸
+ * 成功返回 0，失败返回 -1（数据损坏 / 容量不足） */
+int decoder_decode_jpeg(const void *src, size_t src_size,
+                        void *dst, size_t dst_size, int rgb565,
+                        unsigned *out_w, unsigned *out_h);
+
+/* 【相对上游 V4L2-Camera-App 的本地扩展】
+ * 只读 JPEG 头拿尺寸，不解码。
+ * 有了它调用方才能精确分配 decoder_decode_jpeg 需要的输出缓冲，
+ * 而不是按最坏情况猜大小。成功返回 0 */
+int decoder_jpeg_size(const void *src, size_t src_size,
+                      unsigned *out_w, unsigned *out_h);
+
+/* 【相对上游 V4L2-Camera-App 的本地扩展】
+ * 当前链接的 libjpeg 是否支持 RGB565 直出（只有 libjpeg-turbo 有）。
+ *
+ * 必须在调用 decoder_decode_jpeg 之前问一下：返回 0 时那个 rgb565 参数
+ * 会被忽略、一律输出 RGB24，调用方若按 2 字节/像素分配缓冲，
+ * 尺寸校验会失败——表现为「明明图片没问题却解不开」。 */
+int decoder_have_rgb565(void);
+
 /* 像素格式的可读名字（日志用） */
 const char *pixel_format_name(pixel_format fmt);
 

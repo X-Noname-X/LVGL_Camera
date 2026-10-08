@@ -10,8 +10,8 @@
  *   LV_USE_LOG          0 -> 1                 打开日志
  *   LV_LOG_LEVEL        -> LV_LOG_LEVEL_INFO   才能看到驱动的 INFO 级诊断
  *   LV_LOG_PRINTF       0 -> 1                 日志走 printf；不开则全部静默丢弃
- *   （字体不在这里配）内置 CJK 字体是残缺子集，改用 app/font_zh_16.c，
- *                     由 tools/gen_font.sh 生成，在 main.c 里设给 screen
+ *   LV_FONT_MONTSERRAT_24  0 -> 1             按钮图标字体（LV_SYMBOL_* 就在
+ *                                            Montserrat 的私用区字形里）
  *   LV_USE_LINUX_FBDEV  0 -> 1                 走 /dev/fb0 显示
  *   LV_USE_EVDEV        0 -> 1                 走 /dev/input/eventX 触摸
  *
@@ -1053,7 +1053,7 @@
 #define LV_FONT_MONTSERRAT_22 0
 
 /** Montserrat 24 */
-#define LV_FONT_MONTSERRAT_24 0
+#define LV_FONT_MONTSERRAT_24 1
 
 /** Montserrat 26 */
 #define LV_FONT_MONTSERRAT_26 0

@@ -138,16 +138,23 @@ static void jerr_exit(j_common_ptr cinfo)
     longjmp(e->jmp, 1);          // 跳回 setjmp 处
 }
 
-/* MJPEG → RGB24 或 RGB565，内存解码，不落盘。
+/* JPEG → RGB24 或 RGB565，内存解码，不落盘。
+ *
+ * expect_w/expect_h 非 0 时，要求文件尺寸与之完全一致——摄像头场景用这个：
+ * 大小帧混进来会让后续按声明尺寸推算的缓冲、缩放表全部错位。
+ * 相册读照片时尺寸事先不知道，传 0 表示不校验、以文件头为准。
+ *
+ * out_w/out_h 非 NULL 时写回实际解码尺寸（两者与 expect 校验用的是同一组值）。
  *
  * rgb565 为真时用 libjpeg-turbo 的 JCS_RGB565 扩展，直接出 2 字节/像素。
  * 好处是色彩转换那一步在库内部就完成了、且走 NEON，
  * 调用方省掉一整遍 RGB24→RGB565 的逐像素转换，也省掉 691KB 的中间缓冲。
  * 字节序无需担心：库里的 PACK_SHORT_565_LE 与我们小端机上 LVGL 的
  * RGB565 布局一致（都是 R 占 bit15-11）。 */
-static int mjpeg_to_rgb(const uint8_t *src, size_t src_size, unsigned width,
-                        unsigned height, uint8_t *dst, size_t dst_size,
-                        int rgb565)
+static int jpeg_to_rgb(const uint8_t *src, size_t src_size,
+                       unsigned expect_w, unsigned expect_h,
+                       uint8_t *dst, size_t dst_size, int rgb565,
+                       unsigned *out_w, unsigned *out_h)
 {
     struct jpeg_decompress_struct cinfo;
     struct jerr_mgr jerr;
@@ -169,9 +176,13 @@ static int mjpeg_to_rgb(const uint8_t *src, size_t src_size, unsigned width,
     jpeg_mem_src(&cinfo, (unsigned char *)src, (unsigned long)src_size);
     if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) goto out;
 
-    // 分辨率必须与采集端协商的一致，否则直接判失败
-    if (cinfo.image_width != width || cinfo.image_height != height) goto out;
-    if (dst_size < (size_t)width * height * bpp) goto out;
+    /* 尺寸一律以文件头为准。校验和缓冲容量检查都用它，
+     * 不能用调用方声明的值——那种在 expect 为 0 时根本不存在 */
+    const unsigned w = cinfo.image_width;
+    const unsigned h = cinfo.image_height;
+
+    if (expect_w && (w != expect_w || h != expect_h)) goto out;
+    if (dst_size < (size_t)w * h * bpp) goto out;
 
 #if HAVE_JCS_RGB565
     cinfo.out_color_space = rgb565 ? JCS_RGB565 : JCS_RGB;
@@ -193,6 +204,10 @@ static int mjpeg_to_rgb(const uint8_t *src, size_t src_size, unsigned width,
         row += cinfo.output_width * bpp;
     }
     jpeg_finish_decompress(&cinfo);
+
+    /* 只在成功路径上写回，此时不可能发生过 longjmp */
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
     rc = 0;
 
 out:
@@ -209,8 +224,9 @@ int decoder_decode(decoder *d, const void *src, size_t src_size,
     case PIX_FMT_YUYV:
         return yuyv_to_rgb24(src, src_size, d->width, d->height, dst, dst_size);
     case PIX_FMT_MJPEG:
-        return mjpeg_to_rgb(src, src_size, d->width, d->height, dst, dst_size,
-                            d->mjpeg_565);
+        /* 传 0 之外的期望尺寸：采集来的帧必须和协商值一致 */
+        return jpeg_to_rgb(src, src_size, d->width, d->height,
+                           dst, dst_size, d->mjpeg_565, NULL, NULL);
     case PIX_FMT_RGB24:
         if (src_size > dst_size) return -1;
         memcpy(dst, src, src_size);
@@ -218,4 +234,57 @@ int decoder_decode(decoder *d, const void *src, size_t src_size,
     default:
         return -1;
     }
+}
+
+/* 【相对上游 V4L2-Camera-App 的本地扩展，上游没有这个函数】
+ * 解码内存里的一张独立 JPEG，输出尺寸由文件头决定而非调用方预先声明。
+ * 相册浏览照片用这个——照片是摄像头当初拍下的，尺寸事先并不知道。
+ *
+ * 与 decoder_decode 的区别只有「尺寸从哪来」，解码路径和参数完全一致，
+ * 所以 RGB565 输出、合并上采样器这些优化同样生效。 */
+int decoder_decode_jpeg(const void *src, size_t src_size,
+                        void *dst, size_t dst_size, int rgb565,
+                        unsigned *out_w, unsigned *out_h)
+{
+    if (!src || src_size == 0 || !dst) return -1;
+    /* expect 传 0 = 不校验尺寸，dst_size 的检查会用文件头里的真实尺寸做 */
+    return jpeg_to_rgb(src, src_size, 0, 0,
+                       dst, dst_size, rgb565, out_w, out_h);
+}
+
+/* 只读 JPEG 头拿尺寸，不解码。
+ *
+ * 存在的意义是让调用方能**精确分配**输出缓冲——否则只能按最坏情况猜，
+ * 要么浪费内存，要么猜小了直接失败。读头只解析几个标记段，很快就返回。 */
+int decoder_have_rgb565(void)
+{
+    return HAVE_JCS_RGB565;
+}
+
+int decoder_jpeg_size(const void *src, size_t src_size,
+                      unsigned *out_w, unsigned *out_h)
+{
+    struct jpeg_decompress_struct cinfo;
+    struct jerr_mgr jerr;
+    /* volatile 的理由同 jpeg_to_rgb：这两个变量在 setjmp 之后被改过 */
+    volatile int created = 0, rc = -1;
+
+    if (!src || src_size == 0) return -1;
+
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = jerr_exit;
+    if (setjmp(jerr.jmp)) goto out;
+
+    jpeg_create_decompress(&cinfo);
+    created = 1;
+    jpeg_mem_src(&cinfo, (unsigned char *)src, (unsigned long)src_size);
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) goto out;
+
+    if (out_w) *out_w = cinfo.image_width;
+    if (out_h) *out_h = cinfo.image_height;
+    rc = 0;
+
+out:
+    if (created) jpeg_destroy_decompress(&cinfo);
+    return rc;
 }

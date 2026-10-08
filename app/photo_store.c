@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>   /* malloc / free / qsort */
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -84,6 +85,88 @@ int photo_store_count(void)
         if (photo_index_of(e->d_name) > 0) n++;
     }
     closedir(d);
+    return n;
+}
+
+void photo_store_path(const char *name, char *out, size_t cap)
+{
+    if (!name || !out || cap == 0) return;
+    snprintf(out, cap, "%s/%s", g_dir, name);
+}
+
+int photo_store_delete(const char *name)
+{
+    /* 比 PATH_MAX 多留一截给 "/文件名"——不然目录名很长时会被截断，
+     * 截断出来的路径多半不存在，unlink 会失败，但报错信息会误导人 */
+    char path[PATH_MAX + 64];
+
+    if (!name || name[0] == '\0' || g_dir[0] == '\0') return -1;
+
+    snprintf(path, sizeof(path), "%s/%s", g_dir, name);
+
+    if (unlink(path) != 0) {
+        fprintf(stderr, "[存储] 删除 %s 失败: %s\n", path, strerror(errno));
+        return -1;
+    }
+    printf("[存储] 已删除 %s\n", path);
+    fflush(stdout);
+    return 0;
+}
+
+/* 排序用：把编号和名字绑在一起 */
+typedef struct {
+    int  idx;
+    char name[PHOTO_NAME_MAX];
+} sortable;
+
+static int cmp_by_idx(const void *a, const void *b)
+{
+    int ia = ((const sortable *)a)->idx;
+    int ib = ((const sortable *)b)->idx;
+    return (ia > ib) - (ia < ib);
+}
+
+int photo_store_list(char (*names)[PHOTO_NAME_MAX], int max)
+{
+    if (!names || max <= 0 || g_dir[0] == '\0') return 0;
+
+    DIR *d = opendir(g_dir);
+    if (d == NULL) return 0;
+
+    sortable *v = malloc(sizeof(*v) * (size_t)max);
+    if (v == NULL) {
+        fprintf(stderr, "[存储] 列表缓冲分配失败（%d 项）\n", max);
+        closedir(d);
+        return 0;
+    }
+
+    int n = 0;
+    struct dirent *e;
+    while (n < max && (e = readdir(d)) != NULL) {
+        int idx = photo_index_of(e->d_name);
+        if (idx <= 0) continue;               /* 不是我们的照片，跳过 */
+
+        /* d_name 最长可到 255 字节，而 name 只有 32。理论上 photo_index_of
+         * 已经筛掉了过长的名字，但长度检查不能省——少了它编译器会报
+         * -Wformat-truncation，而且真出现超长文件名时就是一次截断。
+         * 用 memcpy 而不是 snprintf：长度已确认，且不会有格式串告警 */
+        size_t len = strlen(e->d_name);
+        if (len >= PHOTO_NAME_MAX) continue;
+
+        v[n].idx = idx;
+        memcpy(v[n].name, e->d_name, len + 1);
+        n++;
+    }
+    closedir(d);
+
+    /* 按编号数值排序，不用 strcmp——%d 生成的编号位数可能不同，
+     * 那时 photo_10000 会排到 photo_9999 前面，字典序是错的 */
+    qsort(v, (size_t)n, sizeof(*v), cmp_by_idx);
+
+    for (int i = 0; i < n; i++)
+        snprintf(names[i], PHOTO_NAME_MAX, "%s", v[i].name);
+
+    free(v);
     return n;
 }
 

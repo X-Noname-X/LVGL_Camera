@@ -28,13 +28,26 @@ UI 用 LVGL v10 搭建，全屏输出到 `/dev/fb0`。
 
 ## 当前进度
 
+**功能已全部完成。**
+
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | 1 | LVGL 点亮：`/dev/fb0` 显示 + 触摸 | ✅ |
 | 2 | 摄像头实时预览 | ✅ 28.7 fps |
-| 3 | 按键拍照保存 | ⬜ |
-| 4 | 相册浏览 | ⬜ |
-| 5 | 删除图片 | ⬜ |
+| 3 | 按键拍照保存 | ✅ 零编码，存原始 MJPEG 帧 |
+| 4 | 相册浏览 | ✅ 单张大图 + 左右翻页 |
+| 5 | 删除图片 | ✅ 带二次确认 |
+
+### 界面语言约定
+
+| 位置 | 用什么 | 为什么 |
+|---|---|---|
+| **按键** | 图标（`LV_SYMBOL_*`） | 图标字体白拿，不用自造 |
+| **屏幕上的提示文字** | 英文 / ASCII | 项目不含中文字体，写汉字会是方框 |
+| **终端 printf 日志** | 中文 | 终端能正常显示 UTF-8，中文更省事 |
+
+图标不是独立字体——`LV_SYMBOL_*` 是一组 Unicode 私用区码点，字形直接编在
+Montserrat 里。所以 `lv_conf.h` 开一个 `LV_FONT_MONTSERRAT_24` 就白得 60 个图标。
 
 ---
 
@@ -43,36 +56,38 @@ UI 用 LVGL v10 搭建，全屏输出到 `/dev/fb0`。
 ```
 LVGL_Camera/
 ├── app/
-│   ├── main.c              UI 搭建、LVGL 驱动注册、主循环
-│   ├── camera_preview.c/.h 采集线程管理、缩放、三缓冲发布
-│   └── font_zh_16.c        中文字体子集（gen_font.sh 生成，勿手改）
-├── libcamera/              V4L2 采集 + 环形队列 + 解码（见下方"来源"）
-│   ├── capture.c           设备打开、格式协商、mmap、采集线程
-│   ├── frame_queue.c       有界环形缓冲，满了丢旧留新
-│   ├── decoder.c           MJPEG / YUYV → RGB565 或 RGB24
-│   └── include/camera/     三个头文件
-├── lvgl/                   LVGL v10.0 源码（上游原样）
+│   ├── main.c                  UI 搭建、LVGL 驱动注册、主循环
+│   ├── camera_preview.c/.h     采集线程管理、缩放、三缓冲发布
+│   ├── photo_store.c/.h        照片文件：命名、列目录、删除
+│   └── photo_view.c/.h         读文件 → 解码 → 缩放适配
+├── libcamera/                  V4L2 采集 + 环形队列 + 解码（见下方"来源"）
+│   ├── capture.c               设备打开、格式协商、mmap、采集线程
+│   ├── frame_queue.c           有界环形缓冲，满了丢旧留新
+│   ├── decoder.c               MJPEG / YUYV → RGB565 或 RGB24
+│   └── include/camera/         三个头文件
+├── lvgl/                       LVGL v10.0 源码（上游原样）
 ├── tools/
-│   ├── build_libjpeg_turbo.sh   交叉编译 libjpeg-turbo + NEON
-│   ├── build_libjpeg.sh         交叉编译 IJG jpeg-9b（回退用）
-│   └── gen_font.sh              生成中文字体子集
-├── lv_conf.h               LVGL 配置，文件头列了全部改动
-├── toolchain.cmake         锁定工具链与 sysroot
+│   ├── build_libjpeg_turbo.sh  交叉编译 libjpeg-turbo + NEON
+│   ├── build_libjpeg.sh        交叉编译 IJG jpeg-9b（回退用）
+│   └── gen_font.sh             生成中文字体子集（现已不用，留作备查）
+├── lv_conf.h                   LVGL 配置，文件头列了全部改动
+├── toolchain.cmake             锁定工具链与 sysroot
 └── CMakeLists.txt
 ```
 
 **`libcamera/` 的来源**：从 `~/V4L2-Camera-App` 拷贝而来（那是个 PC 上的
 多线程 V4L2 采集库，用 SDL2 开预览窗口）。本项目只取它的库部分，
-并做了一处扩展：`decoder_set_mjpeg_rgb565()`——让 MJPEG 直接输出 RGB565。
-该扩展在 `decoder.h` 里标注了「上游没有」。**改动请同步两边。**
+并做了几处扩展，都在 `decoder.h` 里标了「上游没有」：
+`decoder_set_mjpeg_rgb565()`、`decoder_decode_jpeg()`、`decoder_jpeg_size()`、
+`decoder_have_rgb565()`。**改动请同步两边。**
 
 ---
 
 ## 构建
 
-### 前置：三个一次性步骤
+### 前置：两个一次性步骤
 
-下面这两个源码包**不在 git 仓库里**（`.gitignore` 忽略了 `*.tar.gz`），
+下面这些源码包**不在 git 仓库里**（`.gitignore` 忽略了 `*.tar.gz`），
 需要自己准备，放到项目根目录：
 
 | 文件 | 用途 | 来源 |
@@ -98,19 +113,6 @@ tools/build_libjpeg_turbo.sh
 
 产物在 `jpeg-arm-turbo/`（约 2.2 MB）。
 这一步是性能的关键——见[性能优化记录](#性能优化记录)第 ① 项。
-
-**③ 生成中文字体子集**
-
-```bash
-tools/gen_font.sh
-```
-
-产物 `app/font_zh_16.c`。从系统字体抽子集，只含 UI 用到的字。
-
-> **为什么不用 LVGL 内置的 CJK 字体**：那两款 `lv_font_source_han_sans_sc_*_cjk`
-> 并不是完整思源黑体，实测只覆盖 1450 个码点、其中汉字仅 **297** 个
-> （`range_length = 52772` 只是 cmap 声明的跨度，真实字符数看 `list_length`）。
-> 本项目 UI 用字一个都不在里面，直接就是满屏方块。
 
 ### 编译
 
@@ -140,17 +142,38 @@ IJG 版拿不到 RGB565 路径会自动退回 RGB24（**别改成 `#ifdef JCS_RG
 ## 运行
 
 ```bash
-./lvgl_camera [fbdev] [input_event] [video_dev]
+./lvgl_camera
 ```
 
-默认 `/dev/fb0`、`/dev/input/event1`、`/dev/video0`。
-**所以在本板上通常要显式指定第三个参数**：
+四个参数都有默认值，直接跑即可：
+
+| 参数 | 默认值 |
+|---|---|
+| fbdev | `/dev/fb0` |
+| input_event | `/dev/input/event1` |
+| video_dev | `/dev/video2` |
+| photo_dir | `/run/media/mmcblk0p1/photos` |
+
+需要覆盖时才按位置传参，比如触摸没反应要换个 event 号：
 
 ```bash
-./lvgl_camera /dev/fb0 /dev/input/event1 /dev/video2
+./lvgl_camera /dev/fb0 /dev/input/event0
 ```
 
-`Ctrl+C` 会顺序停掉采集与解码线程再退出，不会把摄像头设备留在半开状态。
+> **照片目录为什么是 `/run/media/mmcblk0p1`**：那是系统自动挂载 SD 卡的位置，
+> 插卡就挂、重启后依然是这个路径。而自己 `mkdir` + `mount` 的 `/mnt/sdcard`
+> 有个静默陷阱——卡没挂时它**依然"存在"**（是根文件系统上的空目录），
+> 照片会被悄悄写进 eMMC 且不报任何错。已经踩过一次。
+> 用 `/run/media/...` 的话卡不在就压根没这个路径，启动即报错，失败得早。
+
+`Ctrl+C` 的收尾顺序：
+
+1. 停采集与解码线程（不会把摄像头设备留在半开状态）
+2. 删掉预览定时器
+3. **把屏幕清成黑色**
+
+第 3 步是必须的——不清的话 LCD 会一直停着最后一帧预览画面，
+看上去像程序还在跑、或者像死机了。
 
 启动后每秒输出一行统计：
 
@@ -235,10 +258,16 @@ fb0 帧缓冲              255 KB      ← 16bpp，与上面一一对应
 ## 常见问题
 
 **触摸没反应** — 多半是 event 号不对，见 `/proc/bus/input/devices` 里
-touchscreen 那段的 `Handlers=`。不用重新编译，换第三个参数即可。
+touchscreen 那段的 `Handlers=`。不用重新编译，换第二个参数即可。
 
-**屏幕上一片方块** — 中文字体缺字。把新文案的字补进 `tools/gen_font.sh`
-的 `SYMBOLS`，重跑该脚本再构建。脚本末尾自带校验，缺字当场报错。
+**屏幕上一片方块** — 往界面上写了汉字。项目里**没有中文字体**，
+只剩 Montserrat 一套拉丁字形。屏幕上的文案要么用 `LV_SYMBOL_*` 图标，
+要么用 ASCII 英文；终端 `printf` 不受此限，照旧用中文。
+
+**照片存到了 eMMC 上而不是 SD 卡** — 检查照片目录。默认是
+`/run/media/mmcblk0p1/photos`，卡不在时这个路径不存在、启动即报错，
+不会静默写错地方。反过来，如果用的是自己 `mkdir` + `mount` 的路径
+（比如 `/mnt/sdcard`），卡没挂时程序察觉不到，照片会悄悄落进 eMMC。
 
 **"打开 /dev/fb0 失败"却没有任何 errno 输出** — 典型的 LVGL 内存池耗尽。
 该失败路径只写 `LV_LOG_ERROR` 不 `perror`，所以必须先打开 `LV_LOG_PRINTF`
@@ -383,14 +412,57 @@ MJPEG 实际每帧只有 20 KB 左右，**约 99% 是浪费的**。
 `CMakeLists.txt` 一度没加 `-Wall`，留下 3 个未使用变量却一声不响。
 现已对**我们自己写的代码**开 `-Wall -Wextra`。
 
-**3. LVGL 内置的 CJK 字体是残缺子集。** 见上文构建部分的说明。
+**3. LVGL 内置的 CJK 字体是残缺子集。**
+那两款 `lv_font_source_han_sans_sc_*_cjk` 并不是完整思源黑体，实测只覆盖
+1450 个码点、其中汉字仅 **297** 个（`range_length = 52772` 只是 cmap 声明的
+跨度，真实字符数看 `list_length`）。当时 UI 用字一个都不在里面，满屏方块。
+
+> 这是**历史**：界面后来改成「图标 + 英文」，中文字体已经整个移除了，
+> 现在用内置的 `LV_FONT_MONTSERRAT_24`。`tools/gen_font.sh` 保留备查。
 
 **4. `lv_font_conv` 合并多字体时会静默丢字形。**
 某个字符若被后声明的字体请求、而那个字体没有，它会把先声明字体
 **已经提供**的同一个字形一并抹掉。所以分工必须干净：汉字和中文标点走 CJK 源，
 ASCII 和排印标点走拉丁源，不重叠。`tools/gen_font.sh` 末尾带自动校验。
+（同上，这是历史经验，脚本现已不用。）
 
 **5. LVGL 的 STDLIB 默认值是给单片机的。**
 `LV_USE_STDLIB_MALLOC` 默认 `LV_STDLIB_BUILTIN`，内存池只有 64 KB。
 该失败路径只写 `LV_LOG_ERROR` 不 `perror`，症状是「打开 /dev/fb0 失败」
 却没有任何 errno 输出，极难定位。
+
+**6. 忘了 LVGL 按创建顺序叠放。**
+浮动提示 `g_toast` 一度建在相册页**之前**，被相册页整个盖住——
+相册里删完照片那句「Deleted」根本看不见。凡是"要盖在所有东西之上"的
+浮层，创建顺序必须排在最后。
+
+**7. 缺头文件靠传递包含侥幸编译。**
+`main.c` 用 `memset` 却没有 `<string.h>`、`photo_store.c` 用 `malloc`/`qsort`
+却没有 `<stdlib.h>`，都是靠别的头文件顺带包含进来的。**两次都栽在同一件事上。**
+换了包含顺序或编译器版本就会突然编不过。
+
+**8. 测试用例抓到的行为问题：小照片被放大。**
+`photo_view` 原本会把比显示区小的照片放大填满，既费 CPU 又糊。
+改成**不放大**——照片小于显示区就按原尺寸出。
+
+**9. LVGL 默认主题给按钮加了向下的投影。**
+`src/themes/default/lv_theme_default.c` 的 `styles.btn` 里有：
+
+```c
+lv_style_set_shadow_color(&theme->styles.btn, lv_palette_main(LV_PALETTE_GREY));
+lv_style_set_shadow_width(&theme->styles.btn, LV_DPX_CALC(dpi, 3));
+lv_style_set_shadow_opa(&theme->styles.btn,   LV_OPA_50);
+lv_style_set_shadow_offset_y(&theme->styles.btn, LV_DPX_CALC(dpi, 3));  /* 向下偏 3 */
+```
+
+按钮浮在预览画面和照片上时，这圈灰影就表现为**下半边发虚、像重影**。
+主题里 `radius`/`bg_opa`/`bg_color`/`pad` 都覆盖了，唯独容易漏掉阴影——
+`lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN)` 清掉即可。
+
+**10. 忘了 LVGL 按创建顺序叠放（第二次踩）。**
+见上文第 6 条。同一个坑在这个项目里踩了两次，新增浮层时先想清楚它该在谁上面。
+
+**11. 退出时屏幕停在最后一帧。**
+`Ctrl+C` 后程序退了，但 framebuffer 里还是最后那帧预览，看上去像还在跑或者死机。
+收尾时清一次屏即可：删掉预览定时器（否则它会往已释放的对象上刷）→
+`lv_obj_clean()` + 底色改黑 + `lv_refr_now()` 强制立刻重绘一次。

@@ -40,13 +40,14 @@ add_subdirectory(lvgl)
 # ---------------------------------------------------------------------------
 add_subdirectory(libcamera)
 
-# font_zh_16.c 是 tools/gen_font.sh 生成的中文字体子集，不是手写的，
-# 但必须参与编译。改了 UI 文案要用字后重跑那个脚本再重新构建。
+# UI 全部用图标，不再需要中文字体——图标取自 LVGL 内置的
+# lv_font_montserrat_24（LV_SYMBOL_* 就编在 Montserrat 的私用区字形里），
+# 见 lv_conf.h。tools/gen_font.sh 现在没在用了，留着备查。
 add_executable(lvgl_camera
     app/main.c
     app/camera_preview.c
     app/photo_store.c
-    app/font_zh_16.c
+    app/photo_view.c
 )
 
 # pthread：camera_preview 的解码线程，以及 libcamera 内部的采集线程
