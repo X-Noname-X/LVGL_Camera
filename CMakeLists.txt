@@ -35,14 +35,31 @@ add_subdirectory(lvgl)
 # 应用
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# 采集层：V4L2 采集 + 环形队列 + 解码（libcamera.a）
-# 它自己会去找 ARM 版 libjpeg，见 libcamera/CMakeLists.txt
+# 采集层：V4L2 采集 + 环形队列 + 解码
+#
+# 链接的是上游 ~/V4L2-Camera-App 交叉编译后 install 出来的产物，本仓库不放
+# 它的源码——上游本来就把库编成 libcamera.a，那就是给人链接用的。两个前缀
+# 都由 tools/ 下的脚本生成，见 README「构建 → 前置」。
 # ---------------------------------------------------------------------------
-add_subdirectory(libcamera)
+set(LIBCAMERA_DIR "${CMAKE_SOURCE_DIR}/libcamera-arm"
+    CACHE PATH "libcamera.a 的 install prefix")
+set(JPEG_ARM_DIR  "${CMAKE_SOURCE_DIR}/jpeg-arm-turbo"
+    CACHE PATH "ARM 版 libjpeg 的 install prefix")
+
+if(NOT EXISTS "${JPEG_ARM_DIR}/lib/libjpeg.a")
+    message(FATAL_ERROR
+        "找不到 ARM 版 libjpeg-turbo: ${JPEG_ARM_DIR}/lib/libjpeg.a\n"
+        "  先跑: tools/build_libjpeg_turbo.sh")
+endif()
+if(NOT EXISTS "${LIBCAMERA_DIR}/lib/libcamera.a")
+    message(FATAL_ERROR
+        "找不到 ARM 版 libcamera.a: ${LIBCAMERA_DIR}/lib/libcamera.a\n"
+        "  先跑: tools/build_libcamera.sh")
+endif()
 
 # UI 全部用图标，不再需要中文字体——图标取自 LVGL 内置的
 # lv_font_montserrat_24（LV_SYMBOL_* 就编在 Montserrat 的私用区字形里），
-# 见 lv_conf.h。tools/gen_font.sh 现在没在用了，留着备查。
+# 见 lv_conf.h。
 add_executable(lvgl_camera
     app/main.c
     app/camera_preview.c
@@ -50,8 +67,18 @@ add_executable(lvgl_camera
     app/photo_view.c
 )
 
+# 头文件来自 libcamera 的 install prefix（app/ 里都是 #include "camera/xxx.h"）
+target_include_directories(lvgl_camera PRIVATE "${LIBCAMERA_DIR}/include")
+
+# 两个 .a 都写全路径。静态库之间不传递依赖，libcamera.a 用的 libjpeg
+# 得在这里显式链上，否则是一堆未定义符号。
 # pthread：camera_preview 的解码线程，以及 libcamera 内部的采集线程
-target_link_libraries(lvgl_camera PRIVATE lvgl::lvgl camera m pthread)
+target_link_libraries(lvgl_camera PRIVATE
+    lvgl::lvgl
+    "${LIBCAMERA_DIR}/lib/libcamera.a"
+    "${JPEG_ARM_DIR}/lib/libjpeg.a"
+    m pthread
+)
 
 # 只给自己写的代码开告警，不加到 lvgl 上——那会淹掉我们自己真正的问题。
 # 之前没开，未使用的变量一声不响地留着，是个教训。

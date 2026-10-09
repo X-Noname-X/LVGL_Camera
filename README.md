@@ -60,32 +60,30 @@ LVGL_Camera/
 │   ├── camera_preview.c/.h     采集线程管理、缩放、三缓冲发布
 │   ├── photo_store.c/.h        照片文件：命名、列目录、删除
 │   └── photo_view.c/.h         读文件 → 解码 → 缩放适配
-├── libcamera/                  V4L2 采集 + 环形队列 + 解码（见下方"来源"）
-│   ├── capture.c               设备打开、格式协商、mmap、采集线程
-│   ├── frame_queue.c           有界环形缓冲，满了丢旧留新
-│   ├── decoder.c               MJPEG / YUYV → RGB565 或 RGB24
-│   └── include/camera/         三个头文件
 ├── lvgl/                       LVGL v10.0 源码（上游原样）
 ├── tools/
 │   ├── build_libjpeg_turbo.sh  交叉编译 libjpeg-turbo + NEON
-│   ├── build_libjpeg.sh        交叉编译 IJG jpeg-9b（回退用）
-│   └── gen_font.sh             生成中文字体子集（现已不用，留作备查）
+│   └── build_libcamera.sh      交叉编译上游 V4L2-Camera-App 的库
 ├── lv_conf.h                   LVGL 配置，文件头列了全部改动
 ├── toolchain.cmake             锁定工具链与 sysroot
 └── CMakeLists.txt
 ```
 
-**`libcamera/` 的来源**：从 `~/V4L2-Camera-App` 拷贝而来（那是个 PC 上的
-多线程 V4L2 采集库，用 SDL2 开预览窗口）。本项目只取它的库部分，
-并做了几处扩展，都在 `decoder.h` 里标了「上游没有」：
-`decoder_set_mjpeg_rgb565()`、`decoder_decode_jpeg()`、`decoder_jpeg_size()`、
-`decoder_have_rgb565()`。**改动请同步两边。**
+**采集库从哪来**：上游 `~/V4L2-Camera-App` 把 V4L2 采集 + 环形队列 + 解码编成
+`libcamera.a`，本项目**链它的产物**，不拷它的源码——它本来就是独立仓库、也是个
+库，源码留在那儿。`tools/build_libcamera.sh` 交叉编译并 install 到
+`libcamera-arm/`（`.gitignore` 忽略），CMake 从这里取 `lib/libcamera.a` 和
+`include/camera/*.h`。
+
+> 这仓库里因此**一份嵌入的源码都没有**——工具链、LVGL、libjpeg、libcamera
+> 全在仓库外，靠脚本取得。早先 `libcamera/` 是拷进来的，那是错的：
+> 同一个库存两份、只能手同步，分叉了还查不出来（真发生过）。
 
 ---
 
 ## 构建
 
-### 前置：两个一次性步骤
+### 前置：三个一次性步骤
 
 下面这些源码包**不在 git 仓库里**（`.gitignore` 忽略了 `*.tar.gz`），
 需要自己准备，放到项目根目录：
@@ -93,8 +91,7 @@ LVGL_Camera/
 | 文件 | 用途 | 来源 |
 |---|---|---|
 | `gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf.tar.xz` | 交叉工具链 | 正点原子 SDK |
-| `libjpeg-turbo-3.0.4.tar.gz` | MJPEG 解码（默认） | GitHub: `libjpeg-turbo/libjpeg-turbo` releases |
-| `jpegsrc.v9b.tar.gz` | MJPEG 解码（IJG 回退，可选） | `~/embedded-linux-simple-camera/thirdlibs/` |
+| `libjpeg-turbo-3.0.4.tar.gz` | MJPEG 解码（必需，RGB565 直出依赖它） | GitHub: `libjpeg-turbo/libjpeg-turbo` releases |
 
 **① 解压工具链**（约 430 MB，解到项目根目录）
 
@@ -114,6 +111,16 @@ tools/build_libjpeg_turbo.sh
 产物在 `jpeg-arm-turbo/`（约 2.2 MB）。
 这一步是性能的关键——见[性能优化记录](#性能优化记录)第 ① 项。
 
+**③ 交叉编译 libcamera（上游 V4L2-Camera-App 的库）**
+
+```bash
+tools/build_libcamera.sh
+```
+
+上游默认在 `~/V4L2-Camera-App`，换位置用 `V4L2_CAMERA_APP=<路径>` 覆盖。
+产物在 `libcamera-arm/`，里头还有个 `VERSION` 记着这次装的是上游哪个 commit
+——前缀被 `.gitignore` 忽略，不留这个就无从追溯装的是哪一版。
+
 ### 编译
 
 ```bash
@@ -123,19 +130,6 @@ cmake --build build -j$(nproc)
 
 产物 `build/lvgl_camera`（约 1.2 MB）。
 我们自己的代码开了 `-Wall -Wextra`；不加到 lvgl 上，否则会淹掉真正的问题。
-
-### 回退到 IJG 原版 libjpeg 对比
-
-```bash
-cmake -DCMAKE_TOOLCHAIN_FILE=toolchain.cmake -B build \
-      -DJPEG_ARM_DIR=$PWD/jpeg-arm
-cmake --build build -j$(nproc)
-```
-
-换回 turbo 就去掉 `-DJPEG_ARM_DIR` 重新 configure。
-`decoder.c` 里用 `#ifdef LIBJPEG_TURBO_VERSION` 做了保护，
-IJG 版拿不到 RGB565 路径会自动退回 RGB24（**别改成 `#ifdef JCS_RGB565`**，
-原因见文末踩坑第 1 条）。
 
 ---
 
@@ -404,9 +398,10 @@ MJPEG 实际每帧只有 20 KB 左右，**约 99% 是浪费的**。
 
 **1. `#ifdef JCS_RGB565` 恒为假。**
 `JCS_RGB565` 是 `J_COLOR_SPACE` 枚举里的**枚举常量**，不是宏，
-而 `#ifdef` 只检测宏。结果是明明链着 turbo 却一直走 RGB24 路径，
-**且编译期毫无提示**。正确做法是检测 `LIBJPEG_TURBO_VERSION`
-（turbo 的 `jconfig.h` 用 `#define` 给出，IJG 版没有）。
+而 `#ifdef` 只检测宏，写成那样恒为假、**且编译期毫无提示**。
+一度改成运行时探测（检测 `LIBJPEG_TURBO_VERSION` + 开关 + IJG 回退），
+后来从根上解决：解码器只输出 RGB565、硬性要求 turbo，
+探测和回退连同它们带来的那些双路径一起删掉了。
 
 **2. "零告警"曾经不可靠。**
 `CMakeLists.txt` 一度没加 `-Wall`，留下 3 个未使用变量却一声不响。
@@ -418,13 +413,12 @@ MJPEG 实际每帧只有 20 KB 左右，**约 99% 是浪费的**。
 跨度，真实字符数看 `list_length`）。当时 UI 用字一个都不在里面，满屏方块。
 
 > 这是**历史**：界面后来改成「图标 + 英文」，中文字体已经整个移除了，
-> 现在用内置的 `LV_FONT_MONTSERRAT_24`。`tools/gen_font.sh` 保留备查。
+> 现在用内置的 `LV_FONT_MONTSERRAT_24`。
 
 **4. `lv_font_conv` 合并多字体时会静默丢字形。**
 某个字符若被后声明的字体请求、而那个字体没有，它会把先声明字体
 **已经提供**的同一个字形一并抹掉。所以分工必须干净：汉字和中文标点走 CJK 源，
-ASCII 和排印标点走拉丁源，不重叠。`tools/gen_font.sh` 末尾带自动校验。
-（同上，这是历史经验，脚本现已不用。）
+ASCII 和排印标点走拉丁源，不重叠。（同上，历史经验。）
 
 **5. LVGL 的 STDLIB 默认值是给单片机的。**
 `LV_USE_STDLIB_MALLOC` 默认 `LV_STDLIB_BUILTIN`，内存池只有 64 KB。

@@ -10,21 +10,26 @@
 # ---- 构建产物 ----
 /build/
 
+# tools/build_*.sh 把 cmake/make 的日志写在构建目录**旁边**（不是里面）：
+# cmake 在建立构建目录之前就失败时，塞在里面就没地方写日志了。
+# 对应 libcamera-build.cmake.log / libjpeg-turbo-build.make.log 这些。
+*-build*.log
+
 
 # ---- 第三方库：源码与构建目录 ----
 # 全部由 tools/ 下的脚本重新解压、重新编译，没必要入库
 #
 # 注意：gitignore 不支持行尾注释，# 之后会被当成模式的一部分。
 # 下面这些模式必须独占一行，注释写在上面。
-/jpeg-9b/
 /libjpeg-turbo-3.0.4/
 /libjpeg-turbo-build/
 
-# ---- 第三方库：编译好的 ARM 产物 ----
-#   jpeg-arm/         重建: tools/build_libjpeg.sh        (IJG 原版，回退用)
-#   jpeg-arm-turbo/   重建: tools/build_libjpeg_turbo.sh  (带 NEON，默认用这个)
-/jpeg-arm/
+# ---- 编译好的 ARM 产物 ----
+#   jpeg-arm-turbo/   重建: tools/build_libjpeg_turbo.sh  （第三方 libjpeg-turbo）
+#   libcamera-arm/    重建: tools/build_libcamera.sh      （上游 V4L2-Camera-App 的库）
 /jpeg-arm-turbo/
+/libcamera-arm/
+/libcamera-build/
 
 # ---- 源码压缩包 ----
 # 第三方二进制包，共约 3.3 MB。缺了构建脚本会明确报错并提示，
@@ -66,11 +71,6 @@
 # ===========================================================================
 # 以下文件【要入库】，别误加进来
 # ===========================================================================
-#   app/font_zh_16.c
-#       虽然 tools/gen_font.sh 能重新生成，但它依赖 npx（要联网）和
-#       DejaVuSans / DroidSansFallbackFull 两个特定系统字体，太脆弱。
-#       生成的源码才 96 KB，直接入库更省事。
-#
 #   lv_conf.h
 #       手改过的配置，文件头列了相对模板的全部改动，丢了就白干。
 #
