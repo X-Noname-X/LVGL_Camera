@@ -1,12 +1,13 @@
 #include "camera/decoder.h"
 
 #include <stdlib.h>   // malloc / free
-#include <string.h>   // memcpy
-#include <stdint.h>   // uint8_t
+#include <stdint.h>   // uint8_t / uint16_t
 
-/* MJPEG 依赖 libjpeg 的 API（jpeglib.h / jpeg_*），发行版装的几乎都是
- * libjpeg-turbo，它与 IJG 原版在 API/ABI 上兼容，所以找到哪个都行
- * 注意别跟 TurboJPEG API（turbojpeg.h）混为一谈：那是另一套高层封装 */
+/* MJPEG 依赖 libjpeg 的 API（jpeglib.h / jpeg_*）。
+ *
+ * 本文件要求 libjpeg-turbo：RGB565 直出用的是它的 JCS_RGB565 扩展，
+ * IJG 原版没有这个枚举，编不过——这是故意的，编不过比悄悄出花屏好。
+ * 另外别跟 TurboJPEG API（turbojpeg.h）混为一谈：那是另一套高层封装 */
 #include <stdio.h>    // jpeglib.h 用到 FILE，必须先包含
 #include <jpeglib.h>
 #include <setjmp.h>
@@ -15,30 +16,14 @@ struct decoder {
     pixel_format fmt;
     unsigned width;
     unsigned height;
-    /* MJPEG 专用：置位后解码直接输出 RGB565 而非 RGB24。
-     * 这是相对上游 V4L2-Camera-App 的本地扩展，见 decoder_set_mjpeg_rgb565() */
-    int mjpeg_565;
 };
 
-/* 判断链的是不是 libjpeg-turbo。
- *
- * 【别改成 #ifdef JCS_RGB565】JCS_RGB565 是 J_COLOR_SPACE 枚举里的一个
- * 枚举常量，不是宏。而 #ifdef 只能检测宏，写成那样会恒为假——
- * 结果就是明明链着 turbo 却一直走 RGB24 路径，且没有任何编译期提示。
- * 踩过这个坑。
- *
- * LIBJPEG_TURBO_VERSION 由 turbo 的 jconfig.h 用 #define 给出（如 "3.0.4"），
- * IJG 原版没有，是可靠的区分标志。 */
-#ifdef LIBJPEG_TURBO_VERSION
-#  define HAVE_JCS_RGB565 1
-#else
-#  define HAVE_JCS_RGB565 0
-#endif
-
-/* 每个输出像素的字节数。MJPEG 走了 RGB565 就是 2，其余一律 3（RGB24） */
-static size_t out_bpp(const decoder *d)
+/* R/G/B(0-255) 打包成 RGB565。
+ * 小端机上与 LVGL 的 RGB565 布局、以及 libjpeg-turbo 的 PACK_SHORT_565_LE
+ * 一致（都是 R 占 bit15-11），所以解出来的缓冲可以直接送屏幕 */
+static uint16_t pack565(int r, int g, int b)
 {
-    return (d->fmt == PIX_FMT_MJPEG && d->mjpeg_565) ? 2 : 3;
+    return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
 
 const char *pixel_format_name(pixel_format fmt)
@@ -62,21 +47,7 @@ decoder *decoder_create(pixel_format fmt, unsigned width, unsigned height)
     d->fmt = fmt;
     d->width = width;
     d->height = height;
-    d->mjpeg_565 = 0;
     return d;
-}
-
-int decoder_set_mjpeg_rgb565(decoder *d)
-{
-    if (!d) return -1;
-    /* 只有 MJPEG 有这条路径；YUYV / RGB24 那两个分支固定输出 RGB24 */
-    if (d->fmt != PIX_FMT_MJPEG) return -1;
-#if !HAVE_JCS_RGB565
-    return -1;   /* 当前链的是 IJG 原版，没有 RGB565 输出 */
-#else
-    d->mjpeg_565 = 1;
-    return 0;
-#endif
 }
 
 void decoder_destroy(decoder *d)
@@ -86,7 +57,7 @@ void decoder_destroy(decoder *d)
 
 size_t decoder_output_size(const decoder *d)
 {
-    return d ? (size_t)d->width * d->height * out_bpp(d) : 0;
+    return d ? (size_t)d->width * d->height * 2 : 0;
 }
 
 // 把整数截回 [0,255]（BT.601 定点运算会溢出）
@@ -97,15 +68,16 @@ static int clamp_byte(int v)
     return v;
 }
 
-/* YUYV → RGB24，BT.601 全范围整数变换，避免浮点
+/* YUYV → RGB565，BT.601 全范围整数变换，避免浮点
  * YUYV 每 4 字节 = 相邻 2 像素（Y0 U Y1 V），要求 width 为偶数（V4L2 下恒成立） */
-static int yuyv_to_rgb24(const uint8_t *src, size_t src_size, unsigned width,
-                         unsigned height, uint8_t *dst, size_t dst_size)
+static int yuyv_to_rgb565(const uint8_t *src, size_t src_size, unsigned width,
+                          unsigned height, uint8_t *dst, size_t dst_size)
 {
     size_t npix = (size_t)width * height;
+    uint16_t *out = (uint16_t *)dst;
 
     if (src_size < npix * 2) return -1;   // YUYV 每像素 2 字节
-    if (dst_size < npix * 3) return -1;
+    if (dst_size < npix * 2) return -1;
 
     for (size_t i = 0; i < npix; i += 2) {
         int y0 = src[0], u = src[1], y1 = src[2], v = src[3];
@@ -113,14 +85,14 @@ static int yuyv_to_rgb24(const uint8_t *src, size_t src_size, unsigned width,
         src += 4;
 
         c = y0 - 16;
-        *dst++ = (uint8_t)clamp_byte((298 * c + 409 * e + 128) >> 8);
-        *dst++ = (uint8_t)clamp_byte((298 * c - 100 * d - 208 * e + 128) >> 8);
-        *dst++ = (uint8_t)clamp_byte((298 * c + 516 * d + 128) >> 8);
+        *out++ = pack565(clamp_byte((298 * c + 409 * e + 128) >> 8),
+                         clamp_byte((298 * c - 100 * d - 208 * e + 128) >> 8),
+                         clamp_byte((298 * c + 516 * d + 128) >> 8));
 
         c = y1 - 16;
-        *dst++ = (uint8_t)clamp_byte((298 * c + 409 * e + 128) >> 8);
-        *dst++ = (uint8_t)clamp_byte((298 * c - 100 * d - 208 * e + 128) >> 8);
-        *dst++ = (uint8_t)clamp_byte((298 * c + 516 * d + 128) >> 8);
+        *out++ = pack565(clamp_byte((298 * c + 409 * e + 128) >> 8),
+                         clamp_byte((298 * c - 100 * d - 208 * e + 128) >> 8),
+                         clamp_byte((298 * c + 516 * d + 128) >> 8));
     }
     return 0;
 }
@@ -138,31 +110,21 @@ static void jerr_exit(j_common_ptr cinfo)
     longjmp(e->jmp, 1);          // 跳回 setjmp 处
 }
 
-/* JPEG → RGB24 或 RGB565，内存解码，不落盘。
+/* JPEG → RGB565，内存解码，不落盘。
  *
- * expect_w/expect_h 非 0 时，要求文件尺寸与之完全一致——摄像头场景用这个：
+ * expect_w/expect_h 非 0 时要求文件尺寸与之完全一致——摄像头场景用这个：
  * 大小帧混进来会让后续按声明尺寸推算的缓冲、缩放表全部错位。
  * 相册读照片时尺寸事先不知道，传 0 表示不校验、以文件头为准。
  *
- * out_w/out_h 非 NULL 时写回实际解码尺寸（两者与 expect 校验用的是同一组值）。
- *
- * rgb565 为真时用 libjpeg-turbo 的 JCS_RGB565 扩展，直接出 2 字节/像素。
- * 好处是色彩转换那一步在库内部就完成了、且走 NEON，
- * 调用方省掉一整遍 RGB24→RGB565 的逐像素转换，也省掉 691KB 的中间缓冲。
- * 字节序无需担心：库里的 PACK_SHORT_565_LE 与我们小端机上 LVGL 的
- * RGB565 布局一致（都是 R 占 bit15-11）。 */
-static int jpeg_to_rgb(const uint8_t *src, size_t src_size,
-                       unsigned expect_w, unsigned expect_h,
-                       uint8_t *dst, size_t dst_size, int rgb565,
-                       unsigned *out_w, unsigned *out_h)
+ * out_w/out_h 非 NULL 时写回实际解码尺寸（与 expect 校验用的是同一组值）。 */
+static int jpeg_to_rgb565(const uint8_t *src, size_t src_size,
+                          unsigned expect_w, unsigned expect_h,
+                          uint8_t *dst, size_t dst_size,
+                          unsigned *out_w, unsigned *out_h)
 {
     struct jpeg_decompress_struct cinfo;
     struct jerr_mgr jerr;
     uint8_t *row = dst;
-#if !HAVE_JCS_RGB565
-    rgb565 = 0;   /* 没有 turbo 扩展就退化到 RGB24，保证 bpp 与实际输出一致 */
-#endif
-    const int bpp = rgb565 ? 2 : 3;
     /* volatile：这两个变量在 setjmp 之后被改过，longjmp 跳回来时
      * 只有 volatile 才能保证值不被优化掉（见 C11 7.13.2.1） */
     volatile int created = 0, rc = -1;
@@ -176,32 +138,25 @@ static int jpeg_to_rgb(const uint8_t *src, size_t src_size,
     jpeg_mem_src(&cinfo, (unsigned char *)src, (unsigned long)src_size);
     if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) goto out;
 
-    /* 尺寸一律以文件头为准。校验和缓冲容量检查都用它，
+    /* 尺寸一律以文件头为准：校验和缓冲容量检查都用它，
      * 不能用调用方声明的值——那种在 expect 为 0 时根本不存在 */
     const unsigned w = cinfo.image_width;
     const unsigned h = cinfo.image_height;
 
     if (expect_w && (w != expect_w || h != expect_h)) goto out;
-    if (dst_size < (size_t)w * h * bpp) goto out;
+    if (dst_size < (size_t)w * h * 2) goto out;
 
-#if HAVE_JCS_RGB565
-    cinfo.out_color_space = rgb565 ? JCS_RGB565 : JCS_RGB;
-
-    /* RGB565 想走「合并上采样器」必须关掉 fancy upsampling——
-     * 那条路径把色度上采样和色彩转换并成一遍做，是 libjpeg-turbo 的快路径
-     * （条件见 jdmaster.c 的 use_merged_upsample()）。
-     * 代价是色度改用箱式滤波而非平滑插值。我们反正要缩到 480x270，
-     * 这点差别看不出来，换来的提速是实打实的。*/
-    if (rgb565) cinfo.do_fancy_upsampling = FALSE;
-#else
-    cinfo.out_color_space = JCS_RGB;   /* 没有 turbo 扩展，只能 RGB24 */
-#endif
+    /* JCS_RGB565 让色彩转换在库内部完成、且走合并上采样器的快路径
+     * （条件见 jdmaster.c 的 use_merged_upsample()），调用方不必再转一遍。
+     * 代价是色度改用箱式滤波而非平滑插值——缩到屏幕尺寸后看不出来 */
+    cinfo.out_color_space = JCS_RGB565;
+    cinfo.do_fancy_upsampling = FALSE;
 
     jpeg_start_decompress(&cinfo);
     while (cinfo.output_scanline < cinfo.output_height) {
         unsigned char *rowptr[1] = { row };
         jpeg_read_scanlines(&cinfo, rowptr, 1);
-        row += cinfo.output_width * bpp;
+        row += cinfo.output_width * 2;
     }
     jpeg_finish_decompress(&cinfo);
 
@@ -222,43 +177,33 @@ int decoder_decode(decoder *d, const void *src, size_t src_size,
 
     switch (d->fmt) {
     case PIX_FMT_YUYV:
-        return yuyv_to_rgb24(src, src_size, d->width, d->height, dst, dst_size);
+        return yuyv_to_rgb565(src, src_size, d->width, d->height, dst, dst_size);
     case PIX_FMT_MJPEG:
-        /* 传 0 之外的期望尺寸：采集来的帧必须和协商值一致 */
-        return jpeg_to_rgb(src, src_size, d->width, d->height,
-                           dst, dst_size, d->mjpeg_565, NULL, NULL);
-    case PIX_FMT_RGB24:
-        if (src_size > dst_size) return -1;
-        memcpy(dst, src, src_size);
+        /* expect 传协商尺寸：采集来的帧必须和协商值一致 */
+        return jpeg_to_rgb565(src, src_size, d->width, d->height,
+                              dst, dst_size, NULL, NULL);
+    case PIX_FMT_RGB24: {
+        /* 输入已是 RGB24，逐像素打包成 RGB565 */
+        size_t npix = (size_t)d->width * d->height;
+        if (src_size < npix * 3 || dst_size < npix * 2) return -1;
+        const uint8_t *s = src;
+        uint16_t *o = dst;
+        for (size_t i = 0; i < npix; i++, s += 3)
+            *o++ = pack565(s[0], s[1], s[2]);
         return 0;
+    }
     default:
         return -1;
     }
 }
 
-/* 【相对上游 V4L2-Camera-App 的本地扩展，上游没有这个函数】
- * 解码内存里的一张独立 JPEG，输出尺寸由文件头决定而非调用方预先声明。
- * 相册浏览照片用这个——照片是摄像头当初拍下的，尺寸事先并不知道。
- *
- * 与 decoder_decode 的区别只有「尺寸从哪来」，解码路径和参数完全一致，
- * 所以 RGB565 输出、合并上采样器这些优化同样生效。 */
 int decoder_decode_jpeg(const void *src, size_t src_size,
-                        void *dst, size_t dst_size, int rgb565,
+                        void *dst, size_t dst_size,
                         unsigned *out_w, unsigned *out_h)
 {
     if (!src || src_size == 0 || !dst) return -1;
-    /* expect 传 0 = 不校验尺寸，dst_size 的检查会用文件头里的真实尺寸做 */
-    return jpeg_to_rgb(src, src_size, 0, 0,
-                       dst, dst_size, rgb565, out_w, out_h);
-}
-
-/* 只读 JPEG 头拿尺寸，不解码。
- *
- * 存在的意义是让调用方能**精确分配**输出缓冲——否则只能按最坏情况猜，
- * 要么浪费内存，要么猜小了直接失败。读头只解析几个标记段，很快就返回。 */
-int decoder_have_rgb565(void)
-{
-    return HAVE_JCS_RGB565;
+    /* expect 传 0 = 不校验尺寸，dst_size 用文件头里的真实尺寸检查 */
+    return jpeg_to_rgb565(src, src_size, 0, 0, dst, dst_size, out_w, out_h);
 }
 
 int decoder_jpeg_size(const void *src, size_t src_size,
@@ -266,7 +211,7 @@ int decoder_jpeg_size(const void *src, size_t src_size,
 {
     struct jpeg_decompress_struct cinfo;
     struct jerr_mgr jerr;
-    /* volatile 的理由同 jpeg_to_rgb：这两个变量在 setjmp 之后被改过 */
+    /* volatile 的理由同 jpeg_to_rgb565 */
     volatile int created = 0, rc = -1;
 
     if (!src || src_size == 0) return -1;

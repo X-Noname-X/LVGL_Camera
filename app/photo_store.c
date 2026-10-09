@@ -13,11 +13,10 @@
 
 static char g_dir[PATH_MAX];
 
-/* 判断目录项是不是我们的照片，是则返回它的编号，否则返回 0。
+/* 判断目录项是不是我们的照片，是则返回编号，否则返回 0。
  *
- * 用 %c 吃掉可能的尾巴：sscanf 是前缀匹配，直接写 "photo_%d.jpg" 的话
- * photo_0007.jpg.bak 也会算数。末尾多一个 %c，只有字符串正好在 .jpg
- * 处结束时才返回 1，多一个字符就返回 2，从而被排除。 */
+ * 末尾的 %c 是必需的：sscanf 是前缀匹配，写 "photo_%d.jpg" 会把
+ * photo_0007.jpg.bak 也算进来，多一个 %c 才能只在 .jpg 处正好结束 */
 static int photo_index_of(const char *name)
 {
     int n;
@@ -27,7 +26,7 @@ static int photo_index_of(const char *name)
 }
 
 /* 下一个可用编号 = 目录里最大编号 + 1。
- * 不能简单用「当前张数 + 1」——删掉中间某张后再拍会撞上已有文件 */
+ * 不能用「当前张数 + 1」——删掉中间某张后再拍会撞上已有文件 */
 static int next_index(void)
 {
     DIR *d = opendir(g_dir);
@@ -59,8 +58,7 @@ int photo_store_init(const char *dir)
         return -1;
     }
 
-    /* 建好了还不够，得确认真的能写——只读挂载、权限不对都会在这里暴露，
-     * 而不是等到用户按下快门才失败 */
+    /* 还得确认真能写——只读挂载、权限不对在这里就暴露，而不是等按快门 */
     if (access(g_dir, W_OK) != 0) {
         fprintf(stderr, "[存储] 目录不可写 %s: %s\n", g_dir, strerror(errno));
         return -1;
@@ -96,8 +94,7 @@ void photo_store_path(const char *name, char *out, size_t cap)
 
 int photo_store_delete(const char *name)
 {
-    /* 比 PATH_MAX 多留一截给 "/文件名"——不然目录名很长时会被截断，
-     * 截断出来的路径多半不存在，unlink 会失败，但报错信息会误导人 */
+    /* 比 PATH_MAX 多留一截给 "/文件名"，否则长目录名会被截断 */
     char path[PATH_MAX + 64];
 
     if (!name || name[0] == '\0' || g_dir[0] == '\0') return -1;
@@ -146,10 +143,8 @@ int photo_store_list(char (*names)[PHOTO_NAME_MAX], int max)
         int idx = photo_index_of(e->d_name);
         if (idx <= 0) continue;               /* 不是我们的照片，跳过 */
 
-        /* d_name 最长可到 255 字节，而 name 只有 32。理论上 photo_index_of
-         * 已经筛掉了过长的名字，但长度检查不能省——少了它编译器会报
-         * -Wformat-truncation，而且真出现超长文件名时就是一次截断。
-         * 用 memcpy 而不是 snprintf：长度已确认，且不会有格式串告警 */
+        /* d_name 最长 255 字节而 name 只有 32。用 memcpy 而非 snprintf：
+         * 长度已确认，也不会有格式串告警 */
         size_t len = strlen(e->d_name);
         if (len >= PHOTO_NAME_MAX) continue;
 
@@ -159,8 +154,7 @@ int photo_store_list(char (*names)[PHOTO_NAME_MAX], int max)
     }
     closedir(d);
 
-    /* 按编号数值排序，不用 strcmp——%d 生成的编号位数可能不同，
-     * 那时 photo_10000 会排到 photo_9999 前面，字典序是错的 */
+    /* 按数值排序，不用 strcmp——位数不同时 photo_10000 会排到 photo_9999 前 */
     qsort(v, (size_t)n, sizeof(*v), cmp_by_idx);
 
     for (int i = 0; i < n; i++)
@@ -173,11 +167,8 @@ int photo_store_list(char (*names)[PHOTO_NAME_MAX], int max)
 int photo_store_save(const uint8_t *data, size_t size,
                      char *name_out, size_t name_cap)
 {
-    /* 都要留出拼接余地：g_dir 最长可占满 PATH_MAX，再拼 "/photo_0001.jpg"
-     * 就越界了。tmp 还比 final 多拼一个 ".tmp"，所以必须开得更大，
-     * 否则 snprintf 仍可能截断。
-     * 写死 PATH_MAX 会触发 -Wformat-truncation——GCC 7 起才有这个告警，
-     * 所以 ARM 用的 4.9.4 不会报，但问题真实存在 */
+    /* 都要留出拼接余地：g_dir 最长可占满 PATH_MAX，再拼文件名就越界。
+     * tmp 比 final 还多一个 ".tmp"，所以开得更大 */
     char final[PATH_MAX + 64];
     char tmp[PATH_MAX + 80];
     int  idx;
@@ -213,8 +204,7 @@ int photo_store_save(const uint8_t *data, size_t size,
         off += (size_t)n;
     }
 
-    /* 先落盘再改名。这样断电时最多留下一个 .tmp 文件，
-     * 绝不会出现「名字是 photo_0001.jpg、内容却只有半张图」的情况 */
+    /* 先落盘再改名：断电时最多留一个 .tmp，不会出现半个文件顶着正式名字 */
     if (fsync(fd) != 0) {
         fprintf(stderr, "[存储] fsync 失败: %s\n", strerror(errno));
         close(fd);
