@@ -1,10 +1,10 @@
 /*
- * 拍照走零编码路径：每个 MJPEG 帧本身就是一张完整 JPEG，直接写盘即可，
+ * 拍照走零编码路径：每个 MJPEG 帧本身就是一张完整 JPEG，直接写文件即可，
  * 没有编码开销和画质损失，存下来还是摄像头原始分辨率。
  *
  * 布局全部按 fb0 报告的实际分辨率算，不写死尺寸。
  *
- * libcamera 采集线程 → 环形队列 → 本进程解码线程 → 三缓冲 → LVGL 主线程
+ * 采集线程 → 环形队列 → 解码线程 → 三缓冲 → LVGL 主线程
  * 解码线程绝不碰 lv_*，两边只交换一个裸缓冲指针。
  *
  * 用法：./lvgl_camera [fbdev] [input_event] [video_dev] [photo_dir]
@@ -204,7 +204,7 @@ static void album_show_index(void)
         return;
     }
 
-    /* 尺寸每张都不同：LVGL 只在 set_src 时读一次 w/h/cf，必须重填重调 */
+    /* 换照片要重填再 set_src：LVGL 只在 set_src 时读一次 w/h/cf */
     g_album_dsc.header.magic  = LV_IMAGE_HEADER_MAGIC;
     g_album_dsc.header.cf     = LV_COLOR_FORMAT_RGB565;
     g_album_dsc.header.w      = (uint32_t)w;
@@ -518,7 +518,7 @@ int main(int argc, char **argv)
         usleep(5 * 1000); /* 5ms，够用且不空转烧 CPU */
     }
 
-    /* 顺序收摊：先停采集与解码线程，再让 LVGL 收尾 */
+    /* 先停采集与解码线程，再让 LVGL 收尾 */
     printf("\n[退出] 停止摄像头...\n");
     cam_preview_stop();
 

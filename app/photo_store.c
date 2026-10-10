@@ -50,7 +50,7 @@ int photo_store_init(const char *dir)
         fprintf(stderr, "[存储] 目录路径太长: %s\n", dir);
         return -1;
     }
-    snprintf(g_dir, sizeof(g_dir), "%s", dir);
+    snprintf(g_dir, sizeof(g_dir), "%s", dir);  // g_dir 赋值
 
     /* 已存在就什么都不做（EEXIST 不算错）；不存在才建 */
     if (mkdir(g_dir, 0755) != 0 && errno != EEXIST) {
@@ -204,7 +204,7 @@ int photo_store_save(const uint8_t *data, size_t size,
         off += (size_t)n;
     }
 
-    /* 先落盘再改名：断电时最多留一个 .tmp，不会出现半个文件顶着正式名字 */
+    /* 先写文件再改名：断电时最多留一个 .tmp，不会出现半个文件顶着正式名字 */
     if (fsync(fd) != 0) {
         fprintf(stderr, "[存储] fsync 失败: %s\n", strerror(errno));
         close(fd);

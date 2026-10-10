@@ -71,9 +71,8 @@ static int ensure(uint8_t **buf, size_t *cap, size_t need)
     return 0;
 }
 
-/* 最近邻等比缩放到 RGB565（解码端已直出，这里只做 16 位搬运）。
- *
- * 只在翻页时跑一次，逐像素做除法可以接受；预览那条路径每帧都要跑，所以用查表 */
+/* 等比缩放到 RGB565，用最近邻。输入已经是 RGB565，这里不碰颜色只改尺寸
+ * 翻页才跑一次，逐像素做除法可以接受；预览每帧都要跑，所以那边用查表 */
 static void scale_to_rgb565(const uint8_t *src, int sw, int sh,
                             uint8_t *dst, int dw, int dh)
 {
@@ -99,7 +98,7 @@ const uint8_t *photo_view_open(const char *path, int max_w, int max_h,
 
     if (path == NULL || max_w <= 0 || max_h <= 0) return NULL;
 
-    release_all();   /* 先放掉上一张，再谈新的 */
+    release_all();   // 先释放上一张
 
     file = read_whole_file(path, &fsize);
     if (file == NULL) return NULL;

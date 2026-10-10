@@ -76,8 +76,8 @@ static double now_sec(void)
  * 用最近邻：本来就要逐像素过一遍，改成缩放后循环次数不变，只是源索引变成查表。
  * 双线性要多做 4 邻域加权，A7 上是三四倍开销。640→480 是缩小，边缘可能有锯齿。
  *
- * 解码端直出 RGB565，与 LVGL 的布局一致，这里只做 16 位搬运 */
-static void convert_scale(const uint8_t *src, int src_w, int src_h,
+ * 输入已经是 RGB565，与 LVGL 的布局一致，所以这里不碰颜色 */
+static void scale_into(const uint8_t *src, int src_w, int src_h,
                           uint8_t *dst, int dst_w, int dst_h)
 {
     uint16_t *d = (uint16_t *)dst;
@@ -137,7 +137,7 @@ static void *decode_thread(void *arg)
         }
 
         const int w = g.write_idx;
-        convert_scale(g.decoded, g.cam_w, g.cam_h, g.dst[w], g.out_w, g.out_h);
+        scale_into(g.decoded, g.cam_w, g.cam_h, g.dst[w], g.out_w, g.out_h);
 
         const double t1 = now_sec();
         win_cost  += (t1 - t0);

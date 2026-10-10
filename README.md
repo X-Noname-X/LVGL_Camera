@@ -85,13 +85,25 @@ LVGL_Camera/
 
 ### 前置：三个一次性步骤
 
-下面这些源码包**不在 git 仓库里**（`.gitignore` 忽略了 `*.tar.gz`），
-需要自己准备，放到项目根目录：
+有两样东西不在本仓库里，得先自己准备。
+
+**第一样：两个源码包**，放到项目根目录（`.gitignore` 忽略了 `*.tar.gz`）：
 
 | 文件 | 用途 | 来源 |
 |---|---|---|
 | `gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf.tar.xz` | 交叉工具链 | 正点原子 SDK |
 | `libjpeg-turbo-3.0.4.tar.gz` | MJPEG 解码（必需，RGB565 直出依赖它） | GitHub: `libjpeg-turbo/libjpeg-turbo` releases |
+
+**第二样：采集库的上游仓库 `V4L2-Camera-App`**，clone 到任意位置
+（默认去找 `~/V4L2-Camera-App`）：
+
+```bash
+git clone https://github.com/X-Noname-X/V4L2-Camera-App.git ~/V4L2-Camera-App
+```
+
+本仓库只链它编出来的 `libcamera.a`，不含它的源码，所以这一份是**必需**的
+——少了它第 ③ 步就做不了。clone 到别处可以，用 `V4L2_CAMERA_APP=<路径>`
+告诉脚本就行。
 
 **① 解压工具链**（约 430 MB，解到项目根目录）
 
@@ -117,9 +129,12 @@ tools/build_libjpeg_turbo.sh
 tools/build_libcamera.sh
 ```
 
-上游默认在 `~/V4L2-Camera-App`，换位置用 `V4L2_CAMERA_APP=<路径>` 覆盖。
+编的是上游当前 HEAD。要钉某个版本就先
+`git -C ~/V4L2-Camera-App checkout <tag 或 commit>` 再跑。
+
 产物在 `libcamera-arm/`，里头还有个 `VERSION` 记着这次装的是上游哪个 commit
-——前缀被 `.gitignore` 忽略，不留这个就无从追溯装的是哪一版。
+（工作区有改动会标成 `-dirty`）——前缀被 `.gitignore` 忽略，不留这个就无从
+追溯装的是哪一版。
 
 ### 编译
 
@@ -193,12 +208,15 @@ cmake --build build -j$(nproc)
 ### 线程模型（3 个线程）
 
 ```
-libcamera 采集线程          DQBUF → fq_push（阻塞式，靠 STREAMOFF 唤醒退出）
+采集线程                    DQBUF → fq_push（阻塞式，靠 STREAMOFF 唤醒退出）
         ↓ 环形队列（3 槽，FQ_DROP_OLDEST）
-本模块解码线程              fq_pop → libjpeg 解码 → 缩放 → 发布
+解码线程                    fq_pop → libjpeg 解码 → 缩放 → 发布
         ↓ 三缓冲（互斥锁保护索引）
 LVGL 主线程                 lv_timer(33ms) → 取裸指针 → 渲染
 ```
+
+采集和解码这两个线程都是 `cam_preview_start()` 起的：采集走库里的 `cap_start()`，
+解码直接用 `pthread_create()`。第三个是进程的主线程，`main()` 就跑在它上面。
 
 > ⚠️ **LVGL 不是线程安全的。解码线程绝不调用任何 `lv_*` 函数。**
 > 两边只通过 `cam_preview_frame()` 交换一个裸缓冲指针，
